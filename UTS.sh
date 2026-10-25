@@ -4,6 +4,8 @@ set -euo pipefail
 
 readonly SCRIPT_NAME="Uninstall-Tencent-Service"
 readonly VERSION="1.0.0"
+COMMAND_TIMEOUT=120
+TIMEOUT_KILL=(-k 5)
 FAILURES=0
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
 YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
@@ -39,6 +41,7 @@ ${SCRIPT_NAME} ${VERSION}
 
 选项：
   -y, --yes                跳过确认提示（没有终端时必须使用）
+      --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
   -h, --help               显示本帮助
 
 脚本先运行主机上的官方卸载程序，再删除并验证剩余内容。
@@ -47,6 +50,7 @@ ${SCRIPT_NAME} ${VERSION}
 退出码：
   0         卸载已验证
   1         有步骤失败、仍有残留，或运行被拒绝、取消
+  124、137  命令超时被终止
 HELP
     return
   fi
@@ -58,6 +62,7 @@ Usage: ./UTS.sh [options]
 
 Options:
   -y, --yes                Skip the confirmation prompt (required without a terminal)
+      --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
   -h, --help               Show this help message
 
 Runs the official uninstaller found on the host, then removes and verifies the
@@ -67,6 +72,7 @@ Disable Agent uninstall protection in the Host Security console before running.
 Exit status:
   0         uninstall verified
   1         a step failed, remnants remain, or the run was refused or canceled
+  124, 137  a command timed out and was stopped
 HELP
 }
 
@@ -102,7 +108,7 @@ command_exists() {
 
 run() {
   local rc=0 command=""
-  "$@" </dev/null || rc=$?
+  timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null || rc=$?
   if [[ "${rc}" -ne 0 ]]; then
     command="$(printf ' %q' "$@")"
     warn "Command failed (${rc}):${command}" "命令失败（${rc}）：${command# }"
@@ -117,7 +123,11 @@ require_linux() {
 }
 
 prepare_runtime() {
-  command_exists awk || die "Required command missing: awk. Install it before retrying." "缺少必需命令 awk，请安装后重试。"
+  local tool=""
+  for tool in awk timeout; do
+    command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
+  done
+  timeout -k 1 1 true 2>/dev/null || die "GNU timeout with -k is required. Install coreutils." "需要支持 -k 的 GNU timeout，请安装 coreutils。"
 }
 
 require_root() {
@@ -144,6 +154,12 @@ parse_args() {
   while (($# > 0)); do
     case "$1" in
       -y|--yes) AUTO_YES=1 ;;
+      --timeout)
+        [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,3}$ && "$2" -le 3600 ]] \
+          || die "--timeout requires 1 to 3600 seconds." "--timeout 需要 1 到 3600 之间的秒数。"
+        COMMAND_TIMEOUT="$2"
+        shift
+        ;;
       -h|--help) help=1 ;;
       *) die "Unknown option: $1" "未知选项：$1" ;;
     esac
@@ -217,7 +233,7 @@ remove_paths() {
   local kind="$1" path="" rc=0
   shift
   for path in "$@"; do
-    remove_path "${path}" "${kind}" || rc=1
+    remove_path "${path}" "${kind}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   done
   return "${rc}"
 }
@@ -237,8 +253,8 @@ uninstall_yunjing() {
     warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
     return "${official_rc}"
   fi
-  remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" || rc=1
-  remove_paths file "${YUNJING_FILES[@]}" || rc=1
+  remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  remove_paths file "${YUNJING_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   [[ "${rc}" -eq 0 ]] || return 1
 }
 
@@ -271,6 +287,17 @@ finish() {
   fi
 }
 
+stop_on() {
+  [[ "$1" -eq 124 || "$1" -ge 128 ]]
+}
+
+exit_status() {
+  if stop_on "$1"; then
+    return "$1"
+  fi
+  return 1
+}
+
 main() {
   local verify_rc=0 yunjing_rc=0
 
@@ -287,7 +314,7 @@ main() {
     warn "Host Security agent (YunJing) uninstall is incomplete (${yunjing_rc})." "主机安全 Agent（YunJing）卸载未完成（${yunjing_rc}）。"
     FAILURES=1
     finish 1
-    return 1
+    exit_status "${yunjing_rc}"
   fi
 
   section "Verification" "验证"

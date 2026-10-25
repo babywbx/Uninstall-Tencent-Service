@@ -26,7 +26,7 @@ stat() {
   esac
 }
 """
-EXECUTE = 'sh() { record "exec sh $*"; command sh "$@"; }\n'
+EXECUTE = 'timeout() { record "timeout $*"; shift 3; "$@"; }\n'
 CJK = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 MESSAGE_CALL = re.compile(
     r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|section)'
@@ -194,9 +194,20 @@ class MainTests(UtsFixture):
         self.assertIn("用法：", result.stdout)
 
     def test_options_are_validated(self):
-        for arguments, accepted in (("-y", "1"), ("--yes", "1"), ("--bogus", None), ("-x", None)):
+        for arguments, accepted in (
+            ("--timeout 1", "1"),
+            ("--timeout 3600", "3600"),
+            ("--timeout 0", None),
+            ("--timeout 3601", None),
+            ("--timeout 012", None),
+            ("--timeout 1e3", None),
+            ("--timeout ''", None),
+            ("--timeout", None),
+            ("--bogus", None),
+            ("--timeout 9", "9"),
+        ):
             with self.subTest(arguments=arguments):
-                result = self.run_shell(f'parse_args {arguments}\nprintf "%s\\n" "$AUTO_YES"\n')
+                result = self.run_shell(f'parse_args {arguments}\nprintf "%s\\n" "$COMMAND_TIMEOUT"\n')
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, f"{accepted}\n")
@@ -206,6 +217,7 @@ class MainTests(UtsFixture):
                     self.assertIn("[FAIL]", result.stderr)
         for arguments, message in (
             ("--bogus", "[FAIL] 未知选项：--bogus"),
+            ("--timeout 0", "[FAIL] --timeout 需要 1 到 3600 之间的秒数。"),
         ):
             with self.subTest(arguments=arguments):
                 result = self.run_shell(f"UI_LANG=zh\nparse_args {arguments}\n")
@@ -235,9 +247,9 @@ class MainTests(UtsFixture):
         chinese = invoke(["--help"]).stdout
         self.assertIn("Usage:", english)
         options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
-        self.assertGreaterEqual(len(options), 2)
+        self.assertGreaterEqual(len(options), 3)
         self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
-        for code in ("0", "1"):
+        for code in ("0", "1", "124, 137"):
             self.assertRegex(english, rf"(?m)^  {code}\s+\w")
             self.assertRegex(chinese, rf"(?m)^  {code.replace(', ', '、')}\s+\S")
 
@@ -409,7 +421,7 @@ class MainTests(UtsFixture):
                     self.assertIn("Uninstall-Tencent-Service：未完成", result.stderr)
 
     def test_yunjing_failure_stops_before_verification(self):
-        for status in (1, 7):
+        for status in (1, 7, 124, 137):
             with self.subTest(status=status):
                 result = self.run_shell(
                     f"uninstall_yunjing() {{ record yunjing; return {status}; }}\n"
@@ -418,11 +430,23 @@ class MainTests(UtsFixture):
                     """
                     + "main --yes\n"
                 )
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.returncode, status if status in (124, 137) else 1, result.stdout + result.stderr)
                 self.assertEqual(self.events.read_text().splitlines(), ["yunjing"])
                 self.assertIn(f"Host Security agent (YunJing) uninstall is incomplete ({status})", result.stderr)
                 self.assertNotIn("local uninstall verified", result.stdout)
                 self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
+
+    def test_cleanup_timeout_is_preserved_through_real_component_and_main(self):
+        for status in (124, 137, 143):
+            with self.subTest(status=status):
+                result = self.run_shell(
+                    f"remove_paths() {{ record cleanup-timeout; return {status}; }}\n"
+                    + "verify_uninstall() { record verify; }\n"
+                    + "main --yes"
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), ["cleanup-timeout"])
+                self.assertNotIn("local uninstall verified", result.stdout)
 
     def test_verified_only_when_verification_passed(self):
         for verify_rc in (0, 1):
@@ -448,6 +472,7 @@ class VerifyTests(UtsFixture):
 
     def main(self):
         return (
+            'timeout() { shift 3; "$@"; }\n'
             "main --yes\n"
         )
 

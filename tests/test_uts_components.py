@@ -57,7 +57,7 @@ class YunjingTests(UtsFixture):
                 self.assertEqual(self.vendor_log.read_text(), f"yunjing {chosen}\n")
                 self.assertEqual(
                     self.events.read_text().splitlines(),
-                    [self.official(script, "exec"), *self.local_cleanup()],
+                    [self.official(script, "timeout -k 5 120"), *self.local_cleanup()],
                 )
 
     def test_official_uninstaller_is_executed_directly_like_the_vendor_command(self):
@@ -72,7 +72,7 @@ class YunjingTests(UtsFixture):
         self.assertEqual(self.vendor_log.read_text(), f"python {os.path.realpath(self.primary)}\n")
         self.assertEqual(
             self.events.read_text().splitlines(),
-            [self.official(script, "exec"), *self.local_cleanup()],
+            [self.official(script, "timeout -k 5 120"), *self.local_cleanup()],
         )
 
     def test_official_uninstall_continues_to_verification(self):
@@ -110,7 +110,7 @@ class YunjingTests(UtsFixture):
                 else:
                     self.vendor_script(script, payload)
                 result = self.run_shell(self.executed())
-                official = [self.official(script, "exec")] if executed else []
+                official = [self.official(script, "timeout -k 5 120")] if executed else []
                 expected = status
                 if expected is None:
                     reported = re.search(r"Official uninst\.sh exited with status (\d+)\.", result.stderr)
@@ -133,6 +133,13 @@ class YunjingTests(UtsFixture):
         self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
 
 class ComponentTests(UtsFixture):
+    def test_timeout_stops_component_cleanup_before_later_steps(self):
+        for status in (124, 137, 143):
+            with self.subTest(status=status):
+                result = self.run_shell(f"remove_paths() {{ record timed-out; return {status}; }}\nuninstall_yunjing\n")
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), ["timed-out"])
+
     def test_selection_helpers_list_yunjing_paths(self):
         result = self.run_shell("selected_dirs; echo ---; selected_leftovers")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
