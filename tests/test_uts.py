@@ -1,0 +1,483 @@
+import fcntl
+import os
+from pathlib import Path
+import re
+import select
+import shlex
+import shutil
+import subprocess
+import tempfile
+import termios
+import textwrap
+import threading
+import time
+import unittest
+
+
+SCRIPT = Path(os.environ.get("UTS_SCRIPT", Path(__file__).resolve().parents[1] / "UTS.sh"))
+BASH = shutil.which("bash")
+BASH_MAJOR = int(subprocess.run([BASH, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True).stdout or 0) if BASH else 0
+ROOT_STAT = r"""
+stat() {
+  case "$2" in
+    %u) printf '0\n' ;;
+    %a) printf '755\n' ;;
+    *) return 1 ;;
+  esac
+}
+"""
+EXECUTE = 'sh() { record "exec sh $*"; command sh "$@"; }\n'
+CJK = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
+MESSAGE_CALL = re.compile(
+    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|section)'
+    r'\s+("[^"]*")((?:\s+"[^"]*")*)'
+)
+
+
+@unittest.skipUnless(BASH, "Bash is required")
+class UtsFixture(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="uts-tests-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.root = self.base / "root"
+        self.root.mkdir()
+        for directory in ("tmp", "etc", "proc", "sys", "run", "var", "var/lib", "var/run", "var/spool", "opt"):
+            (self.root / directory).mkdir()
+        (self.root / "etc/os-release").write_text(
+            'ID=debian\nPRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'
+        )
+        self.events = self.base / "events"
+        self.events.touch()
+        self.vendor_log = self.base / "vendor.log"
+        source = SCRIPT.read_text()
+        source = re.sub(
+            r"(?<![A-Za-z0-9_/])/(etc|usr|opt|lib|lib64|proc|sys|run|var|tmp|sbin)(?=/|[\s\"'])",
+            lambda match: f"{self.root}/{match[1]}",
+            source,
+        )
+        self.source = self.base / "UTS.sh"
+        self.source.write_text(source)
+
+    def file_snapshot(self):
+        return {
+            str(path.relative_to(self.root)): (
+                path.stat().st_mode,
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in self.root.rglob("*")
+        }
+
+    def vendor_script(self, path, body):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(body, bytes):
+            path.write_bytes(body)
+        else:
+            path.write_text(body)
+        path.chmod(0o755)
+        return path
+
+    def logging_script(self, label):
+        return (
+            "#!/bin/bash\n"
+            + f'printf "%s %s\\n" {shlex.quote(label)} "$PWD" >> {shlex.quote(str(self.vendor_log))}\n'
+        )
+
+    def official(self, path, prefix="run"):
+        return f'{prefix} sh -c cd -- "${{1%/*}}" && exec "$1" uts {path}'
+
+    def shell_body(self, script):
+        prelude = r"""
+            record() { printf '%s\n' "$*" >> "$UTS_TEST_EVENTS"; }
+            blocked() { record "unexpected-external $*"; return 97; }
+            curl() { blocked curl "$@"; }
+            wget() { blocked wget "$@"; }
+            ssh() { blocked ssh "$@"; }
+            sudo() { blocked sudo "$@"; }
+            rm() { record "rm $*"; return 0; }
+            rmdir() { record "rmdir $*"; return 0; }
+            kill() { blocked kill "$@"; }
+            pkill() { blocked pkill "$@"; }
+            killall() { blocked killall "$@"; }
+            chattr() { blocked chattr "$@"; }
+            crontab() { blocked crontab "$@"; }
+            systemctl() { blocked systemctl "$@"; }
+            service() { blocked service "$@"; }
+            initctl() { blocked initctl "$@"; }
+            chkconfig() { blocked chkconfig "$@"; }
+            update-rc.d() { blocked update-rc.d "$@"; }
+            timeout() { blocked timeout "$@"; }
+            sleep() { record "sleep $*"; SECONDS=$((SECONDS + $1)); }
+            uname() {
+              case "${1:--s}" in
+                -m) printf 'x86_64\n' ;;
+                *) printf 'Linux\n' ;;
+              esac
+            }
+        """
+        overrides = r"""
+            UI_LANG=en
+            require_root() { :; }
+            prepare_runtime() { :; }
+            run() { record "run $*"; return 0; }
+        """
+        return (
+            textwrap.dedent(prelude)
+            + f"\nsource {shlex.quote(str(self.source))}\n"
+            + textwrap.dedent(overrides)
+            + textwrap.dedent(script)
+        )
+
+    def shell_environment(self):
+        return {
+            "PATH": os.environ.get("PATH", os.defpath),
+            "HOME": str(self.base),
+            "TMPDIR": str(self.root / "tmp"),
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "LC_ALL": "C",
+            "UTS_TEST_ROOT": str(self.root),
+            "UTS_TEST_EVENTS": str(self.events),
+        }
+
+    def run_shell(self, script, **options):
+        self.events.write_text("")
+        body = self.shell_body(script)
+        environment = self.shell_environment()
+        options.setdefault("stdin", subprocess.DEVNULL)
+        if "preexec_fn" not in options:
+            options.setdefault("start_new_session", True)
+        environment.update(options.pop("env", {}))
+        options.setdefault("stdout", subprocess.PIPE)
+        options.setdefault("stderr", subprocess.PIPE)
+        result = subprocess.run(
+            [BASH, "--noprofile", "--norc", "-c", body],
+            cwd=self.base,
+            env=environment,
+            text=True,
+            timeout=10,
+            **options,
+        )
+        self.assertNotIn(
+            "unexpected-external",
+            self.events.read_text(),
+            f"Unexpected external command:\n{self.events.read_text()}\n{result.stderr}",
+        )
+        return result
+
+    def assert_failed(self, result):
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(": local uninstall verified.", result.stdout)
+
+    def real_function(self, name):
+        source = self.source.read_text()
+        body = source.split(f"\n{name}() {{\n", 1)[1].split("\n}\n", 1)[0]
+        return f"{name}() {{\n{body}\n}}\n"
+
+    def removal_requested(self, directory):
+        return any(
+            line.startswith("run rm ") and str(directory) in line
+            for line in self.events.read_text().splitlines()
+        )
+
+
+class MainTests(UtsFixture):
+    def test_script_runs_when_piped_to_bash(self):
+        result = subprocess.run(
+            [BASH, "-s", "--", "--help"],
+            input=SCRIPT.read_text(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("用法：", result.stdout)
+
+    def test_options_are_validated(self):
+        for arguments, accepted in (("-y", "1"), ("--yes", "1"), ("--bogus", None), ("-x", None)):
+            with self.subTest(arguments=arguments):
+                result = self.run_shell(f'parse_args {arguments}\nprintf "%s\\n" "$AUTO_YES"\n')
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, f"{accepted}\n")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("[FAIL]", result.stderr)
+        for arguments, message in (
+            ("--bogus", "[FAIL] 未知选项：--bogus"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_shell(f"UI_LANG=zh\nparse_args {arguments}\n")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(message, result.stderr)
+
+    def test_help_lists_every_option_and_exit_status(self):
+        def invoke(arguments, **environment):
+            return subprocess.run(
+                [BASH, str(SCRIPT), *arguments],
+                env={"PATH": os.environ.get("PATH", os.defpath), **environment},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        for arguments, environment in ((["--help"], {}), (["-h"], {"LANG": "en_US.UTF-8", "LC_ALL": "C"})):
+            with self.subTest(arguments=arguments, environment=environment):
+                result = invoke(arguments, **environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertIn("Uninstall-Tencent-Service 1.0.0", result.stdout)
+                self.assertRegex(result.stdout, CJK)
+                self.assertIn("用法：", result.stdout)
+        english = self.run_shell("UI_LANG=en\nusage\n").stdout
+        chinese = invoke(["--help"]).stdout
+        self.assertIn("Usage:", english)
+        options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
+        self.assertGreaterEqual(len(options), 2)
+        self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
+        for code in ("0", "1"):
+            self.assertRegex(english, rf"(?m)^  {code}\s+\w")
+            self.assertRegex(chinese, rf"(?m)^  {code.replace(', ', '、')}\s+\S")
+
+    def test_every_message_has_an_english_and_a_chinese_text(self):
+        source = re.sub(r"\\\n\s*", " ", SCRIPT.read_text())
+        calls = [match for match in MESSAGE_CALL.finditer(source) if match[2] != '"$@"']
+        self.assertGreater(len(calls), 20)
+        for match in calls:
+            if "${MSG}" in match[2]:
+                continue
+            with self.subTest(call=match[0].strip()):
+                texts = re.findall(r'"[^"]*"', match[3])
+                self.assertEqual(len(texts), 1, match[0])
+                self.assertIsNone(CJK.search(match[2]), match[0])
+                self.assertIsNotNone(CJK.search(texts[0]), match[0])
+
+    def test_distribution_name_is_read_without_quotes(self):
+        for source, expected in (
+            ("os-release", "Debian GNU/Linux 12 (bookworm)"),
+            ("lsb_release", "CentOS release 6.10 (Final)"),
+            ("redhat-release", "CentOS release 6.10 (Final)"),
+            ("none", "unknown"),
+        ):
+            with self.subTest(source=source):
+                if source != "os-release":
+                    (self.root / "etc/os-release").unlink(missing_ok=True)
+                release = self.root / "etc/redhat-release"
+                release.unlink(missing_ok=True)
+                if source == "redhat-release":
+                    release.write_text("CentOS release 6.10 (Final)\n")
+                result = self.run_shell(
+                    f'command_exists() {{ [[ "$1" == lsb_release && {source!r} == lsb_release ]]; }}\n'
+                    + """lsb_release() { printf '"CentOS release 6.10 (Final)"\\n'; }\n"""
+                    + 'detect_distro\nprintf "%s\\n" "$DISTRO_PRETTY"\n'
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"{expected}\n")
+
+    STUBBED_MAIN = r"""
+        uninstall_yunjing() { section "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"; record yunjing; }
+        verify_uninstall() { record verify; }
+    """
+
+    def test_confirmation_needs_a_terminal_unless_yes(self):
+        for options, code, events in (
+            ("", 1, []),
+            ("--yes", 0, ["yunjing", "verify"]),
+        ):
+            with self.subTest(options=options):
+                result = self.run_shell(self.STUBBED_MAIN + f"main {options}\n")
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), events)
+                self.assertNotIn("Continue?", result.stdout)
+                if code == 1:
+                    self.assertIn("No terminal for confirmation. Add -y to run unattended.", result.stderr)
+
+    def answer(self, reply, mode="stdin"):
+        master, slave = os.openpty()
+        attributes = termios.tcgetattr(slave)
+        attributes[3] &= ~termios.ECHO
+        attributes[1] &= ~termios.ONLCR
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+        if reply is not None:
+            os.write(master, reply.encode() + b"\n")
+        terminal = bytearray()
+        terminal_closed = threading.Event()
+        self.terminal = terminal
+
+        def drain():
+            while not terminal_closed.is_set():
+                try:
+                    if not select.select([master], [], [], 0.1)[0]:
+                        continue
+                    data = os.read(master, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                terminal.extend(data)
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+
+        def close_terminal():
+            terminal_closed.set()
+            reader.join(timeout=1)
+            os.close(slave)
+            os.close(master)
+
+        self.addCleanup(close_terminal)
+        if mode == "stdin":
+            return {"stdin": slave}
+        if mode == "stdout":
+            return {"stdin": slave, "stdout": slave}
+
+        def attach():
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+        return {"stdin": subprocess.DEVNULL, "preexec_fn": attach}
+
+    def terminal_text(self, until="[y/N]"):
+        deadline = time.monotonic() + 2
+        while until.encode() not in self.terminal and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.terminal.decode()
+
+    def test_confirmation_accepts_only_yes(self):
+        (self.root / "usr/local/qcloud/YunJing").mkdir(parents=True)
+        plan = ["[INFO] System: Debian GNU/Linux 12 (bookworm), x86_64"]
+        summary = [
+            "==> Host Security agent (YunJing)",
+            "==> Verification",
+            "[ OK ] No agent files remain.",
+            "[ OK ] Uninstall-Tencent-Service: local uninstall verified.",
+        ]
+        for reply, proceeds in (("y", True), ("yes", True), ("YES", True), ("n", False), ("", False), ("yess", False)):
+            for mode in ("stdin", "stdout"):
+                with self.subTest(reply=reply, mode=mode):
+                    result = self.run_shell(self.STUBBED_MAIN + "main\n", **self.answer(reply, mode))
+                    if mode == "stdout":
+                        output = self.terminal_text("Uninstall-Tencent-Service: " if proceeds else "[y/N]")
+                        self.assertIn("\nContinue? [y/N] ", output)
+                    else:
+                        output = result.stdout
+                        self.assertIn("\nContinue? [y/N] ", output)
+                    positions = [output.find(line) for line in plan + (summary if proceeds else [])]
+                    self.assertNotIn(-1, positions, output)
+                    self.assertEqual(positions, sorted(positions))
+                    if proceeds:
+                        self.assertEqual(result.returncode, 0, output + result.stderr)
+                        self.assertEqual(self.events.read_text().splitlines(), ["yunjing", "verify"])
+                    else:
+                        self.assertEqual(result.returncode, 1, output + result.stderr)
+                        self.assertEqual(self.events.read_text(), "")
+                        self.assertIn("Canceled; nothing was changed.", result.stderr)
+                        self.assertNotIn("==> Host Security agent", output)
+
+    def test_previous_terminal_output_cannot_satisfy_the_current_prompt(self):
+        previous = self.answer(None)
+        previous_output = self.terminal
+        current = self.answer(None)
+        os.write(previous["stdin"], b"old prompt")
+        deadline = time.monotonic() + 2
+        while b"old prompt" not in previous_output and b"old prompt" not in self.terminal:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertIn(b"old prompt", previous_output)
+        self.assertEqual(self.terminal, b"")
+        os.write(current["stdin"], b"current prompt")
+        self.assertEqual(self.terminal_text("current prompt"), "current prompt")
+
+    def test_chinese_output_has_no_untranslated_lines(self):
+        for language in ("zh", "en"):
+            with self.subTest(language=language):
+                result = self.run_shell(
+                    self.STUBBED_MAIN
+                    + "verify_uninstall() { warn \"Agent processes remain:\" \"仍有 Agent 进程：\"; return 1; }\n"
+                    + f"UI_LANG={language}\nmain --yes\n"
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
+                english = [line for line in lines if not CJK.search(line)]
+                self.assertIn("系统：" if language == "zh" else "System: ", result.stdout)
+                if language == "en":
+                    self.assertEqual(lines, english)
+                else:
+                    self.assertEqual(english, [], result.stdout + result.stderr)
+                    self.assertIn("Uninstall-Tencent-Service：未完成", result.stderr)
+
+    def test_yunjing_failure_stops_before_verification(self):
+        for status in (1, 7):
+            with self.subTest(status=status):
+                result = self.run_shell(
+                    f"uninstall_yunjing() {{ record yunjing; return {status}; }}\n"
+                    + r"""
+                    verify_uninstall() { record verify; }
+                    """
+                    + "main --yes\n"
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), ["yunjing"])
+                self.assertIn(f"Host Security agent (YunJing) uninstall is incomplete ({status})", result.stderr)
+                self.assertNotIn("local uninstall verified", result.stdout)
+                self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
+
+    def test_verified_only_when_verification_passed(self):
+        for verify_rc in (0, 1):
+            with self.subTest(verify_rc=verify_rc):
+                result = self.run_shell(
+                    "uninstall_yunjing() { :; }\n"
+                    + f"verify_uninstall() {{ record verify; return {verify_rc}; }}\n"
+                    + "main --yes\n"
+                )
+                self.assertEqual(self.events.read_text().splitlines(), ["verify"])
+                if verify_rc:
+                    self.assert_failed(result)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("Uninstall-Tencent-Service: local uninstall verified.", result.stdout)
+
+
+class VerifyTests(UtsFixture):
+    def verify(self, stubs=""):
+        return stubs + "\nverify_uninstall\n"
+
+    def main(self):
+        return (
+            "main --yes\n"
+        )
+
+    def test_clean_root_passes_verification(self):
+        result = self.run_shell(self.verify())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.events.read_text(), "")
+
+    def test_remaining_installation_directory_fails_verification(self):
+        yunjing = self.root / "usr/local/qcloud/YunJing"
+        yunjing.mkdir(parents=True)
+        result = self.run_shell(self.verify())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"Installation path remains: {yunjing}.", result.stderr)
+
+    def test_leftover_symlink_fails_verification(self):
+        link = self.root / "tmp/yunjing_install"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(self.root / "usr/local/qcloud/YunJing/installer")
+        result = self.run_shell(self.verify())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"Leftover file remains: {link}.", result.stderr)
+
+    def test_clean_second_run_exits_zero_without_warnings(self):
+        result = self.run_shell(self.main())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("No official uninst.sh found; cleaning local remnants only.", result.stdout)
+        self.assertIn("Uninstall-Tencent-Service: local uninstall verified.", result.stdout)
+        self.assertEqual(
+            [line for line in self.events.read_text().splitlines() if line.startswith("run ")], []
+        )
