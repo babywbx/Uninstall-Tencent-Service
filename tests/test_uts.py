@@ -5,6 +5,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import termios
@@ -251,7 +252,7 @@ class MainTests(UtsFixture):
         options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
         self.assertGreaterEqual(len(options), 4)
         self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
-        for code in ("0", "1", "124, 137"):
+        for code in ("0", "1", "124, 137", "130, 143"):
             self.assertRegex(english, rf"(?m)^  {code}\s+\w")
             self.assertRegex(chinese, rf"(?m)^  {code.replace(', ', '、')}\s+\S")
 
@@ -424,6 +425,36 @@ class MainTests(UtsFixture):
                         self.assertEqual(self.events.read_text(), "")
                         self.assertIn("Canceled; nothing was changed.", result.stderr)
                         self.assertNotIn("==> Host Security agent", output)
+
+    def test_ctrl_c_at_the_prompt_changes_nothing(self):
+        stubs = ROOT_STAT + self.STUBBED_MAIN + "prepare_runtime() { trap 'interrupt 130' INT; trap 'interrupt 143' TERM; }\n"
+        result = self.run_shell(stubs + "main\n", **self.answer("n"))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+        if BASH_MAJOR >= 4:
+            self.events.write_text("")
+            process = subprocess.Popen(
+                [BASH, "--noprofile", "--norc", "-c", self.shell_body(stubs + "main\n")],
+                cwd=self.base,
+                env=self.shell_environment(),
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                **self.answer(None, "stdout"),
+            )
+            try:
+                self.assertIn("Continue? [y/N]", self.terminal_text())
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+            self.assertEqual(process.returncode, 130, stderr.decode())
+            self.assertIn("Interrupted; run the script again to finish the cleanup.", stderr.decode())
+            self.assertEqual(self.events.read_text(), "")
+        result = self.run_shell(stubs + "main\n", **self.answer("y"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text().splitlines(), ["yunjing", "verify"])
 
     def test_previous_terminal_output_cannot_satisfy_the_current_prompt(self):
         previous = self.answer(None)

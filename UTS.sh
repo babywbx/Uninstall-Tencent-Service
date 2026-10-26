@@ -8,6 +8,7 @@ WORKDIR=""
 COMMAND_TIMEOUT=120
 TIMEOUT_KILL=(-k 5)
 FAILURES=0
+RUN_PID=""
 LOCK_DIR="/run/uts.lock"
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
 YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
@@ -33,6 +34,16 @@ cleanup() {
   if [[ -n "${WORKDIR}" ]]; then
     rm -rf -- "${WORKDIR}"
   fi
+}
+
+interrupt() {
+  trap '' INT TERM
+  if [[ -n "${RUN_PID}" ]]; then
+    kill -TERM "${RUN_PID}" 2>/dev/null || true
+    wait "${RUN_PID}" 2>/dev/null || true
+  fi
+  warn "Interrupted; run the script again to finish the cleanup." "已中断，重新运行本脚本即可继续清理。" || true
+  exit "$1"
 }
 
 msg() {
@@ -61,6 +72,7 @@ ${SCRIPT_NAME} ${VERSION}
   0         卸载已验证，或预览完成
   1         有步骤失败、仍有残留，或运行被拒绝、取消
   124、137  命令超时被终止
+  130、143  被中断
 HELP
     return
   fi
@@ -84,6 +96,7 @@ Exit status:
   0         uninstall verified, or dry run finished
   1         a step failed, remnants remain, or the run was refused or canceled
   124, 137  a command timed out and was stopped
+  130, 143  interrupted
 HELP
 }
 
@@ -125,7 +138,10 @@ command_exists() {
 run() {
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     local rc=0 command=""
-    timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null 9>&- || rc=$?
+    timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null 9>&- &
+    RUN_PID=$!
+    wait "${RUN_PID}" || rc=$?
+    RUN_PID=""
     if [[ "${rc}" -ne 0 ]]; then
       command="$(printf ' %q' "$@")"
       warn "Command failed (${rc}):${command}" "命令失败（${rc}）：${command# }"
@@ -161,6 +177,8 @@ prepare_runtime() {
   flock -n 9 || die "Another UTS instance is already running." "已有另一个 UTS 实例在运行。"
   WORKDIR="$(mktemp -d /tmp/uts.XXXXXX)" || die "Cannot create a private work directory." "无法创建私有工作目录。"
   trap cleanup EXIT
+  trap 'interrupt 130' INT
+  trap 'interrupt 143' TERM
 }
 
 require_root() {
