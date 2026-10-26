@@ -33,8 +33,8 @@ class ProcessTests(UtsFixture):
         self.process(900011, f"{real} (deleted)", [f"{self.stargate}/bin/sgagent", "-d"])
         result = self.run_shell('agent_processes "${STARGATE_DIRS[@]}"')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"900010|{real}\n", result.stdout)
-        self.assertIn(f"900011|{real}\n", result.stdout)
+        self.assertIn(f"900010|{real}|", result.stdout)
+        self.assertIn(f"900011|{real}|", result.stdout)
         self.assertNotIn("(deleted)", result.stdout)
 
     def test_arguments_that_only_mention_agent_paths_are_not_matched(self):
@@ -79,6 +79,32 @@ class ProcessTests(UtsFixture):
                 self.assertIn(f"Cannot inspect {warning} for PID 900060.", result.stderr)
                 self.assertIn("900062|", result.stdout)
 
+    def test_signal_requires_unchanged_process_identity(self):
+        self.sgagent()
+        stale_stat = " ".join(["S", *(["0"] * 18), "101"])
+        for pid, changed in ((900070, None), (900071, "exe"), (900072, "start"), (900073, "arguments")):
+            with self.subTest(changed=changed):
+                proc = self.process(pid, str(self.stargate / "bin/sgagent"), ["sgagent", "-d"])
+                change = {
+                    None: ":",
+                    "exe": f"ln -sfn /usr/bin/tail {shlex.quote(str(proc / 'exe'))}",
+                    "start": f"printf '%s\\n' '{pid} (agent worker) {stale_stat}' > {shlex.quote(str(proc / 'stat'))}",
+                    "arguments": f"printf 'sgagent\\0-d\\0-v\\0' > {shlex.quote(str(proc / 'cmdline'))}",
+                }[changed]
+                try:
+                    result = self.run_shell(
+                        'kill() { record "kill $*"; }\n'
+                        'targets="$(agent_processes "${STARGATE_DIRS[@]}")"\n'
+                        + change
+                        + '\nsignal_agent_processes TERM "${targets}"\n'
+                    )
+                finally:
+                    shutil.rmtree(proc)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = [f"kill -TERM {pid}"] if changed is None else []
+                self.assertEqual(self.events.read_text().splitlines(), expected)
+                self.assertNotIn("Cannot signal", result.stderr)
+
     def test_with_real_paths_adds_resolved_directory_and_matches_processes(self):
         real_root = os.path.realpath(self.root)
         data = self.root / "data/qcloud"
@@ -103,7 +129,7 @@ class ProcessTests(UtsFixture):
             f"{real_root}/var/lib/qcloud/YunJing",
         ])
         self.assertEqual(len(lines), 6)
-        self.assertEqual(lines[5], f"900030|{real}")
+        self.assertTrue(lines[5].startswith(f"900030|{real}|"), lines[5])
 
     def test_dry_run_stop_previews_without_signalling_or_waiting(self):
         service = str(self.yunjing / "YDService")

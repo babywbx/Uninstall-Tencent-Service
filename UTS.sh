@@ -175,7 +175,7 @@ require_linux() {
 
 prepare_runtime() {
   local tool=""
-  for tool in awk readlink stat find timeout flock; do
+  for tool in awk readlink stat cksum find timeout flock; do
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
   timeout -k 1 1 true 2>/dev/null || die "GNU timeout with -k is required. Install coreutils." "需要支持 -k 的 GNU timeout，请安装 coreutils。"
@@ -379,6 +379,14 @@ with_real_paths() {
   done
 }
 
+process_token() {
+  local entry="$1" started="" arguments=""
+  started="$(awk '{ sub(/^.*\) /, ""); print $20 }' "${entry}/stat" 2>/dev/null)" || return 1
+  [[ "${started}" =~ ^[0-9]+$ ]] || return 1
+  arguments="$(cksum <"${entry}/cmdline" 2>/dev/null)" || return 1
+  printf '%s|%s' "${started}" "${arguments}"
+}
+
 is_agent_process() {
   local executable="$2"
   shift 2
@@ -386,7 +394,7 @@ is_agent_process() {
 }
 
 agent_processes() {
-  local entry="" pid="" executable="" argv0="" rc=0 match_rc=0
+  local entry="" pid="" executable="" argv0="" token="" rc=0 match_rc=0
   local -a dirs=()
   [[ -r "${PROC_ROOT}/self/status" ]] || { warn "Cannot inspect /proc." "无法检查 /proc。"; return 1; }
   while IFS= read -r entry; do dirs+=("${entry}"); done < <(with_real_paths "$@")
@@ -420,15 +428,23 @@ agent_processes() {
       [[ "${match_rc}" -eq 1 ]] || rc=1
       continue
     fi
-    printf '%s|%s\n' "${pid}" "${executable}"
+    token="$(process_token "${entry}")" || {
+      [[ ! -d "${entry}" ]] || rc=1
+      continue
+    }
+    printf '%s|%s|%s\n' "${pid}" "${executable}" "${token}"
   done
   return "${rc}"
 }
 
 signal_agent_processes() {
-  local signal="$1" targets="$2" pid="" expected=""
-  while IFS='|' read -r pid expected; do
+  local signal="$1" targets="$2" pid="" expected="" current="" started="" arguments="" token=""
+  while IFS='|' read -r pid expected started arguments; do
     [[ -n "${pid}" ]] || continue
+    current="$(readlink -- "${PROC_ROOT}/${pid}/exe" 2>/dev/null)" || continue
+    [[ "${current% (deleted)}" == "${expected}" ]] || continue
+    token="$(process_token "${PROC_ROOT}/${pid}")" || continue
+    [[ "${token}" == "${started}|${arguments}" ]] || continue
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       printf '[DRY-RUN] kill -%s %s (%s)\n' "${signal}" "${pid}" "${expected}" >&3
     else
@@ -439,7 +455,7 @@ signal_agent_processes() {
 
 show_processes() {
   local pid="" executable=""
-  while IFS='|' read -r pid executable; do
+  while IFS='|' read -r pid executable _; do
     printf '  PID %-8s %s\n' "${pid}" "${executable}" >&2
   done <<<"$1"
 }
