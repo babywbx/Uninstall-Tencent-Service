@@ -268,7 +268,7 @@ class MainTests(UtsFixture):
         options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
         self.assertGreaterEqual(len(options), 5)
         self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
-        for code in ("0", "1", "124, 137", "130, 143"):
+        for code in ("0", "1", "6", "124, 137", "130, 143"):
             self.assertRegex(english, rf"(?m)^  {code}\s+\w")
             self.assertRegex(chinese, rf"(?m)^  {code.replace(', ', '、')}\s+\S")
 
@@ -531,7 +531,7 @@ class MainTests(UtsFixture):
                     self.assertIn("Uninstall-Tencent-Service：未完成", result.stderr)
 
     def test_yunjing_failure_skips_optional_components(self):
-        for status in (1, 7, 124, 137):
+        for status in (1, 7, 6, 124, 137):
             with self.subTest(status=status):
                 result = self.run_shell(
                     f"uninstall_yunjing() {{ record yunjing; return {status}; }}\n"
@@ -541,7 +541,7 @@ class MainTests(UtsFixture):
                     """
                     + "main --yes --include-monitor\n"
                 )
-                self.assertEqual(result.returncode, status if status in (124, 137) else 1, result.stdout + result.stderr)
+                self.assertEqual(result.returncode, status if status in (6, 124, 137) else 1, result.stdout + result.stderr)
                 self.assertEqual(self.events.read_text().splitlines(), ["yunjing"])
                 self.assertIn(f"Host Security agent (YunJing) uninstall is incomplete ({status})", result.stderr)
                 self.assertIn("optional components were not processed", result.stderr)

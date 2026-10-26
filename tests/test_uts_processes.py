@@ -131,6 +131,40 @@ class ProcessTests(UtsFixture):
         self.assertEqual(len(lines), 6)
         self.assertTrue(lines[5].startswith(f"900030|{real}|"), lines[5])
 
+    def test_stop_terms_respawned_process_once(self):
+        live = str(self.yunjing / "YDLive")
+        service = str(self.yunjing / "YDService")
+        self.process(900080, live, [live])
+        self.process(900081, service, [service])
+        respawn = self.process(900082, service, [service])
+        shutil.move(str(respawn), str(self.root / "tmp/respawn"))
+        result = self.run_shell(
+            r"""
+            kill() {
+              record "kill $*"
+              mv "${UTS_TEST_ROOT}/proc/$2" "${UTS_TEST_ROOT}/tmp/exited-$2"
+              if [[ "$2" == 900081 ]]; then mv "${UTS_TEST_ROOT}/tmp/respawn" "${UTS_TEST_ROOT}/proc/900082"; fi
+            }
+            stop_agent_processes "${YUNJING_DIRS[@]}"
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text().splitlines(), [
+            "kill -TERM 900080",
+            "kill -TERM 900081",
+            "sleep 1",
+            "kill -TERM 900082",
+            "sleep 1",
+        ])
+
+    def test_surviving_process_is_reported(self):
+        service = str(self.yunjing / "YDService")
+        self.process(900090, service, [service])
+        result = self.run_shell('kill() { record "kill $*"; }\nstop_agent_processes "${YUNJING_DIRS[@]}"\n')
+        self.assertEqual(self.events.read_text().splitlines(), ["kill -TERM 900090"] + ["sleep 1"] * 5)
+        self.assert_failed(result)
+        self.assertIn("Agent processes remain", result.stderr)
+
     def test_dry_run_stop_previews_without_signalling_or_waiting(self):
         service = str(self.yunjing / "YDService")
         self.process(900095, service, [service])

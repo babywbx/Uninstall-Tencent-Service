@@ -78,6 +78,7 @@ ${SCRIPT_NAME} ${VERSION}
 退出码：
   0         卸载已验证，或预览完成
   1         有步骤失败、仍有残留，或运行被拒绝、取消
+  6         因卸载保护或进程无法停止，主机安全 Agent 未被卸载
   124、137  命令超时被终止
   130、143  被中断
 HELP
@@ -103,6 +104,7 @@ Disable Agent uninstall protection in the Host Security console before running.
 Exit status:
   0         uninstall verified, or dry run finished
   1         a step failed, remnants remain, or the run was refused or canceled
+  6         uninstall protection or an unstoppable process kept Host Security
   124, 137  a command timed out and was stopped
   130, 143  interrupted
 HELP
@@ -175,7 +177,7 @@ require_linux() {
 
 prepare_runtime() {
   local tool=""
-  for tool in awk readlink stat cksum find timeout flock; do
+  for tool in awk readlink stat grep cksum find timeout flock; do
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
   timeout -k 1 1 true 2>/dev/null || die "GNU timeout with -k is required. Install coreutils." "需要支持 -k 的 GNU timeout，请安装 coreutils。"
@@ -461,10 +463,23 @@ show_processes() {
 }
 
 stop_agent_processes() {
-  local targets=""
+  local targets="" signalled="" fresh=""
   targets="$(agent_processes "$@")" || return 1
   [[ -n "${targets}" ]] || return 0
   signal_agent_processes TERM "${targets}"
+  [[ "${DRY_RUN}" -eq 0 ]] || return 0
+  signalled="${targets}"
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    targets="$(agent_processes "$@")" || return 1
+    [[ -n "${targets}" ]] || return 0
+    fresh="$(grep -Fxv -f <(printf '%s\n' "${signalled}") <<<"${targets}")" || true
+    [[ -z "${fresh}" ]] || signal_agent_processes TERM "${fresh}"
+    signalled="${targets}"
+  done
+  warn "Agent processes remain; preserving their installation files:" "Agent 进程仍在运行，保留其安装文件："
+  show_processes "${targets}"
+  return 1
 }
 
 remove_paths() {
@@ -474,6 +489,11 @@ remove_paths() {
     remove_path "${path}" "${kind}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   done
   return "${rc}"
+}
+
+guard_hint() {
+  warn "In the Host Security console, turn off Agent uninstall protection or remove" "请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。"
+  warn "this server from its scope, wait about a minute, then run this script again." "约一分钟后重新运行本脚本。"
 }
 
 uninstall_yunjing() {
@@ -491,7 +511,10 @@ uninstall_yunjing() {
     warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
     return "${official_rc}"
   fi
-  stop_agent_processes "${YUNJING_DIRS[@]}" || return 1
+  if ! stop_agent_processes "${YUNJING_DIRS[@]}"; then
+    guard_hint
+    return 6
+  fi
   remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   remove_paths file "${YUNJING_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   [[ "${rc}" -eq 0 ]] || return 1
@@ -566,7 +589,7 @@ stop_on() {
 }
 
 exit_status() {
-  if stop_on "$1"; then
+  if [[ "$1" -eq 6 ]] || stop_on "$1"; then
     return "$1"
   fi
   return 1

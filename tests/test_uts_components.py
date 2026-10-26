@@ -165,6 +165,23 @@ class YunjingTests(UtsFixture):
         self.assertIn("No official uninst.sh found; cleaning local remnants only.", result.stdout)
         self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
 
+    def test_unstoppable_processes_return_6_with_console_hint(self):
+        result = self.run_shell(
+            self.local_stubs
+            + r"""
+            agent_processes() { printf '4242|/a/YDService|1|x\n'; }
+            signal_agent_processes() { record "signal $1"; }
+            """
+            + self.real_function("stop_agent_processes")
+            + "uninstall_yunjing\n"
+        )
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        expected = ["signal TERM"] + ["sleep 1"] * 5
+        self.assertEqual(self.events.read_text().splitlines(), expected)
+        self.assertIn("Agent processes remain; preserving their installation files:", result.stderr)
+        self.assertIn("PID 4242", result.stderr)
+        self.assertIn("turn off Agent uninstall protection", result.stderr)
+
     def test_dry_run_does_not_run_the_official_uninstaller(self):
         self.vendor_script(self.primary / "uninst.sh", self.logging_script("unexpected"))
         snapshot = self.file_snapshot()

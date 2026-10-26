@@ -312,10 +312,7 @@ class LinuxProcessTests(UtsFixture):
             [line.split("|", 1)[0] for line in result.stdout.splitlines()],
             [str(agent.pid)],
         )
-        try:
-            agent.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.fail("The selected agent is still running")
+        self.assertIsNotNone(agent.poll(), "The selected agent is still running")
         self.assertIsNone(bystander.poll(), "An unrelated process was stopped")
         self.assertEqual(self.events.read_text(), f"signal -TERM {agent.pid}\n")
 
