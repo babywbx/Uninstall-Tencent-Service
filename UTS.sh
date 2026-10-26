@@ -12,6 +12,7 @@ YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
 YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup)
 
 AUTO_YES=0
+DRY_RUN=0
 UI_LANG=zh
 MSG=""
 
@@ -41,6 +42,7 @@ ${SCRIPT_NAME} ${VERSION}
 
 选项：
   -y, --yes                跳过确认提示（没有终端时必须使用）
+      --dry-run            只预览将要删除的内容，不做任何修改
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
   -h, --help               显示本帮助
 
@@ -48,7 +50,7 @@ ${SCRIPT_NAME} ${VERSION}
 运行前请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。
 
 退出码：
-  0         卸载已验证
+  0         卸载已验证，或预览完成
   1         有步骤失败、仍有残留，或运行被拒绝、取消
   124、137  命令超时被终止
 HELP
@@ -62,6 +64,7 @@ Usage: ./UTS.sh [options]
 
 Options:
   -y, --yes                Skip the confirmation prompt (required without a terminal)
+      --dry-run            Show what would be removed, change nothing
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
   -h, --help               Show this help message
 
@@ -70,7 +73,7 @@ remnants locally.
 Disable Agent uninstall protection in the Host Security console before running.
 
 Exit status:
-  0         uninstall verified
+  0         uninstall verified, or dry run finished
   1         a step failed, remnants remain, or the run was refused or canceled
   124, 137  a command timed out and was stopped
 HELP
@@ -97,6 +100,11 @@ ok() {
   printf '%s[ OK ]%s %s\n' "${C_GREEN}" "${C_RESET}" "${MSG}"
 }
 
+preview() {
+  msg "$@"
+  printf '[DRY-RUN] %s\n' "${MSG}" >&3
+}
+
 section() {
   msg "$@"
   printf '\n%s==>%s %s%s%s\n' "${C_BOLD}${C_BLUE}" "${C_RESET}" "${C_BOLD}" "${MSG}" "${C_RESET}"
@@ -107,13 +115,19 @@ command_exists() {
 }
 
 run() {
-  local rc=0 command=""
-  timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null || rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
-    command="$(printf ' %q' "$@")"
-    warn "Command failed (${rc}):${command}" "命令失败（${rc}）：${command# }"
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    local rc=0 command=""
+    timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      command="$(printf ' %q' "$@")"
+      warn "Command failed (${rc}):${command}" "命令失败（${rc}）：${command# }"
+    fi
+    return "${rc}"
   fi
-  return "${rc}"
+
+  printf '[DRY-RUN]' >&3
+  printf ' %q' "$@" >&3
+  printf '\n' >&3
 }
 
 require_linux() {
@@ -154,6 +168,7 @@ parse_args() {
   while (($# > 0)); do
     case "$1" in
       -y|--yes) AUTO_YES=1 ;;
+      --dry-run) DRY_RUN=1 ;;
       --timeout)
         [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,3}$ && "$2" -le 3600 ]] \
           || die "--timeout requires 1 to 3600 seconds." "--timeout 需要 1 到 3600 之间的秒数。"
@@ -173,7 +188,7 @@ parse_args() {
 
 confirm() {
   local reply=""
-  [[ "${AUTO_YES}" -eq 0 ]] || return 0
+  [[ "${AUTO_YES}" -eq 0 && "${DRY_RUN}" -eq 0 ]] || return 0
   [[ -t 0 ]] || die "No terminal for confirmation. Add -y to run unattended." "没有可用于确认的终端，无人值守运行请加 -y。"
   msg "Continue? [y/N] " "确认卸载？[y/N] "
   printf '\n%s%s%s' "${C_BOLD}" "${MSG}" "${C_RESET}"
@@ -188,6 +203,10 @@ run_local_script() {
   local script_path="$1" description="" header="" rc=0
   msg "official ${script_path}" "官方卸载程序 ${script_path}"
   description="${MSG}"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    preview "would run ${description}" "将运行${description}"
+    return 0
+  fi
   [[ -s "${script_path}" && -x "${script_path}" ]] || { warn "Empty or non-executable uninstaller: ${description}." "卸载程序为空或不可执行：${description}。"; return 1; }
   IFS= read -r -d '' -n 4 header <"${script_path}" || true
   if [[ "${header}" != '#!'* && "${header}" != $'\177ELF' ]]; then
@@ -223,7 +242,7 @@ remove_path() {
   else
     run rm -f -- "${path}" || return $?
   fi
-  if path_present "${path}"; then
+  if [[ "${DRY_RUN}" -eq 0 ]] && path_present "${path}"; then
     warn "Path still exists: ${path}." "路径仍然存在：${path}。"
     return 1
   fi
@@ -279,7 +298,9 @@ verify_uninstall() {
 finish() {
   local verify_rc="$1"
   printf '\n'
-  if [[ "${FAILURES}" -eq 0 && "${verify_rc}" -eq 0 ]]; then
+  if [[ "${DRY_RUN}" -eq 1 && "${FAILURES}" -eq 0 ]]; then
+    ok "Dry run finished; nothing was changed." "预览完成，未做任何修改。"
+  elif [[ "${DRY_RUN}" -eq 0 && "${FAILURES}" -eq 0 && "${verify_rc}" -eq 0 ]]; then
     ok "${SCRIPT_NAME}: local uninstall verified." "${SCRIPT_NAME}：本地卸载已验证。"
   else
     warn "${SCRIPT_NAME}: incomplete. See the failed operations and remaining items above." \
@@ -301,6 +322,7 @@ exit_status() {
 main() {
   local verify_rc=0 yunjing_rc=0
 
+  exec 3>&1
   parse_args "$@"
   require_linux
   require_root
@@ -317,11 +339,13 @@ main() {
     exit_status "${yunjing_rc}"
   fi
 
-  section "Verification" "验证"
-  if verify_uninstall; then
-    ok "No agent files remain." "未发现 Agent 文件残留。"
-  else
-    verify_rc=$?
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    section "Verification" "验证"
+    if verify_uninstall; then
+      ok "No agent files remain." "未发现 Agent 文件残留。"
+    else
+      verify_rc=$?
+    fi
   fi
   finish "${verify_rc}"
   if [[ "${FAILURES}" -eq 0 && "${verify_rc}" -eq 0 ]]; then

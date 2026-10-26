@@ -29,7 +29,7 @@ stat() {
 EXECUTE = 'timeout() { record "timeout $*"; shift 3; "$@"; }\n'
 CJK = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 MESSAGE_CALL = re.compile(
-    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|section)'
+    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|preview|section)'
     r'\s+("[^"]*")((?:\s+"[^"]*")*)'
 )
 
@@ -247,7 +247,7 @@ class MainTests(UtsFixture):
         chinese = invoke(["--help"]).stdout
         self.assertIn("Usage:", english)
         options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
-        self.assertGreaterEqual(len(options), 3)
+        self.assertGreaterEqual(len(options), 4)
         self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
         for code in ("0", "1", "124, 137"):
             self.assertRegex(english, rf"(?m)^  {code}\s+\w")
@@ -288,15 +288,50 @@ class MainTests(UtsFixture):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, f"{expected}\n")
 
+    def test_dry_run_previews_without_changing_files(self):
+        yunjing = self.root / "usr/local/qcloud/YunJing"
+        self.vendor_script(yunjing / "uninst.sh", "#!/bin/sh\nexit 0\n")
+        before = self.file_snapshot()
+        result = self.run_shell(
+            self.real_function("run")
+            + r"""
+            stat() { printf '0\n'; }
+            verify_uninstall() { record verify; }
+            main --dry-run
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+        previews = [
+            f"[DRY-RUN] would run official {yunjing}/uninst.sh",
+            f"[DRY-RUN] rm -rf -- {yunjing}",
+        ]
+        positions = [result.stdout.find(preview) for preview in previews]
+        self.assertNotIn(-1, positions, result.stdout)
+        self.assertEqual(positions, sorted(positions))
+        steps = [
+            "==> Host Security agent (YunJing)",
+            "[ OK ] Dry run finished; nothing was changed.",
+        ]
+        positions = [result.stdout.find(line) for line in steps]
+        self.assertNotIn(-1, positions, result.stdout)
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("Verification", result.stdout)
+        self.assertNotIn("Continue?", result.stdout)
+        self.assertNotIn("backup.sh", result.stdout)
+        self.assertNotIn("Running official", result.stdout)
+        self.assertEqual(before, self.file_snapshot())
+
     STUBBED_MAIN = r"""
         uninstall_yunjing() { section "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"; record yunjing; }
         verify_uninstall() { record verify; }
     """
 
-    def test_confirmation_needs_a_terminal_unless_yes(self):
+    def test_confirmation_needs_a_terminal_unless_yes_or_dry_run(self):
         for options, code, events in (
             ("", 1, []),
             ("--yes", 0, ["yunjing", "verify"]),
+            ("--dry-run", 0, ["yunjing"]),
         ):
             with self.subTest(options=options):
                 result = self.run_shell(self.STUBBED_MAIN + f"main {options}\n")
@@ -401,6 +436,15 @@ class MainTests(UtsFixture):
         self.assertEqual(self.terminal, b"")
         os.write(current["stdin"], b"current prompt")
         self.assertEqual(self.terminal_text("current prompt"), "current prompt")
+
+    def test_dry_run_with_a_failed_step_is_not_reported_as_finished(self):
+        result = self.run_shell(
+            self.STUBBED_MAIN + "uninstall_yunjing() { return 1; }\nmain --dry-run\n"
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("Dry run finished", result.stdout)
+        self.assertIn("Host Security agent (YunJing) uninstall is incomplete (1).", result.stderr)
+        self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
 
     def test_chinese_output_has_no_untranslated_lines(self):
         for language in ("zh", "en"):

@@ -132,6 +132,15 @@ class YunjingTests(UtsFixture):
         self.assertIn("No official uninst.sh found; cleaning local remnants only.", result.stdout)
         self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
 
+    def test_dry_run_does_not_run_the_official_uninstaller(self):
+        self.vendor_script(self.primary / "uninst.sh", self.logging_script("unexpected"))
+        snapshot = self.file_snapshot()
+        result = self.run_shell(self.executed("exec 3>&1\nDRY_RUN=1\n"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.file_snapshot(), snapshot)
+        self.assertFalse(self.vendor_log.exists())
+        self.assertNotIn("sleep ", self.events.read_text())
+
 class ComponentTests(UtsFixture):
     def test_timeout_stops_component_cleanup_before_later_steps(self):
         for status in (124, 137, 143):
