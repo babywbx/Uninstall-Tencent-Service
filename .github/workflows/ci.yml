@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-lint:
+    name: Quality / Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run Bash Syntax Check
+        run: bash -n UTS.sh
+      - name: Run ShellCheck
+        run: shellcheck UTS.sh
+
+  test-unittest:
+    name: Test / Unittest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set Up uv
+        uses: astral-sh/setup-uv@v10.3.2
+        with:
+          enable-cache: false
+      - name: Run Unittest
+        run: uv run --no-project python -m unittest discover -s tests -v
