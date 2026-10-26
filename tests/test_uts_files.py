@@ -11,6 +11,7 @@ class FileSafetyTests(UtsFixture):
         super().setUp()
         self.installation = self.root / "usr/local/qcloud/YunJing"
         self.installation.mkdir(parents=True)
+        self.enable_proc()
 
     def test_file_symlink_removal_preserves_its_target(self):
         target = self.root / "var/keep.txt"
@@ -50,6 +51,7 @@ class FileSafetyTests(UtsFixture):
                     RUN_REAL
                     + r'''
                     INCLUDE_MONITOR=1
+                    stop_agent_processes() { :; }
                     '''
                     + command
                     + "\n"

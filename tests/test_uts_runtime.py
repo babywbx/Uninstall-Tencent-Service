@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import unittest
 
@@ -27,6 +29,9 @@ FLOCK = shutil.which("flock")
 class RuntimeTests(UtsFixture):
     @unittest.skipUnless(FLOCK, "flock is required for the real lock test")
     def test_lock_rejects_inheriting_instance_and_releases_on_exit(self):
+        proc = self.root / "proc/self"
+        proc.mkdir()
+        (proc / "status").touch()
         stat_override = r'''
             stat() {
               if [[ "$2" == %u:%a && "${@: -1}" == "$LOCK_DIR" ]]; then
@@ -240,3 +245,108 @@ class InterruptTests(UtsFixture):
             if bystander.poll() is None:
                 bystander.terminate()
             bystander.wait(timeout=3)
+
+
+@unittest.skipUnless(sys.platform == "linux" and os.geteuid() == 0, "Linux root /proc access is required")
+class LinuxProcessTests(UtsFixture):
+    def setUp(self):
+        super().setUp()
+        self.installation = self.root / "usr/local/qcloud/YunJing"
+        self.installation.mkdir(parents=True)
+        self.sleep = shutil.which("sleep")
+        if not self.sleep:
+            self.skipTest("sleep is required")
+
+    def spawn(self, arguments, cwd=None):
+        process = subprocess.Popen(
+            arguments,
+            cwd=cwd or self.base,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={
+                "PATH": os.environ.get("PATH", os.defpath),
+                "HOME": str(self.base),
+                "TMPDIR": str(self.root / "tmp"),
+                "LC_ALL": "C",
+            },
+        )
+        self.addCleanup(self.cleanup_process, process)
+        return process
+
+    def cleanup_process(self, process):
+        try:
+            if process.poll() is None:
+                self.assertEqual(os.getsid(process.pid), process.pid)
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=2)
+        except ProcessLookupError:
+            process.wait(timeout=2)
+        finally:
+            if process.stdin:
+                process.stdin.close()
+
+    def stop_agents(self, agent, bystander):
+        result = self.run_shell(
+            f'''
+            PROC_ROOT=/proc
+            unset -f sleep
+            kill() {{
+              case "${{@: -1}}" in
+                {agent.pid}|{bystander.pid}) record "signal $*"; command kill "$@" ;;
+                *) blocked kill "$@"; return 97 ;;
+              esac
+            }}
+            targets="$(agent_processes "${{YUNJING_DIRS[@]}}")" || exit $?
+            printf '%s\\n' "$targets"
+            stop_agent_processes "${{YUNJING_DIRS[@]}}"
+            '''
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [line.split("|", 1)[0] for line in result.stdout.splitlines()],
+            [str(agent.pid)],
+        )
+        try:
+            agent.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.fail("The selected agent is still running")
+        self.assertIsNone(bystander.poll(), "An unrelated process was stopped")
+        self.assertEqual(self.events.read_text(), f"signal -TERM {agent.pid}\n")
+
+    def spawn_agent(self):
+        binary = self.installation / "YDService"
+        shutil.copyfile(os.path.realpath(BASH), binary)
+        binary.chmod(0o755)
+        agent = self.spawn([str(binary), "-c", "while :; do read -r -t 1 line || :; done"])
+        deadline = time.monotonic() + 2
+        while os.readlink(f"/proc/{agent.pid}/exe") != str(binary):
+            self.assertLess(time.monotonic(), deadline, "The agent did not start")
+            time.sleep(0.01)
+        return binary, agent
+
+    def test_real_agent_stop_preserves_spoofed_argv_bystander(self):
+        binary, agent = self.spawn_agent()
+        bystander = self.spawn(
+            [BASH, "-c", 'exec -a "$1" "$2" 30', "uts-test", str(binary), self.sleep]
+        )
+        deadline = time.monotonic() + 2
+        while (
+            os.readlink(f"/proc/{bystander.pid}/exe") != os.path.realpath(self.sleep)
+            or Path(f"/proc/{bystander.pid}/cmdline").read_bytes().split(b"\0")[0] != os.fsencode(binary)
+        ):
+            self.assertLess(time.monotonic(), deadline, "The bystander did not exec sleep with a spoofed argv")
+            time.sleep(0.01)
+        self.stop_agents(agent, bystander)
+
+    def test_deleted_agent_executable_is_still_stopped(self):
+        binary, agent = self.spawn_agent()
+        bystander = self.spawn([self.sleep, "30"])
+        binary.unlink()
+        self.assertTrue(os.readlink(f"/proc/{agent.pid}/exe").endswith(" (deleted)"))
+        self.stop_agents(agent, bystander)

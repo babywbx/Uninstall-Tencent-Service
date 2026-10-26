@@ -18,6 +18,7 @@ MOCKS = r"""
     INCLUDE_MONITOR=1
 """
 LATER_STEPS = r"""
+    stop_agent_processes() { record stop-processes; }
     remove_path() { record "remove $1"; }
     remove_empty_dir() { record "remove-empty $1"; }
     INCLUDE_MONITOR=1
@@ -39,11 +40,13 @@ def install_monitor(root, prefix, scripts=True):
 
 class YunjingTests(UtsFixture):
     local_stubs = r"""
+        stop_agent_processes() { record "stop-processes $*"; }
         remove_path() { record "remove $1"; }
     """
 
     def setUp(self):
         super().setUp()
+        self.enable_proc()
         self.primary = self.root / "usr/local/qcloud/YunJing"
         self.fallback = self.root / "var/lib/qcloud/YunJing"
 
@@ -54,6 +57,7 @@ class YunjingTests(UtsFixture):
 
     def local_cleanup(self):
         return [
+            f"stop-processes {self.primary} {self.fallback}",
             *self.removals(),
         ]
 
@@ -173,6 +177,7 @@ class YunjingTests(UtsFixture):
 class MonitorTests(UtsFixture):
     def setUp(self):
         super().setUp()
+        self.enable_proc()
 
     def reset(self):
         for prefix in ("usr/local/qcloud", "var/lib/qcloud"):
@@ -211,10 +216,11 @@ class MonitorTests(UtsFixture):
                 )
                 events = self.events.read_text().splitlines()
                 self.assertEqual(
-                    events[:2],
+                    events[:3],
                     [
                         self.official(barad, "timeout -k 5 120"),
                         self.official(sgagent, "timeout -k 5 120"),
+                        "stop-processes",
                     ],
                 )
 
@@ -284,14 +290,38 @@ class MonitorTests(UtsFixture):
         for path in leftovers:
             self.assertFalse(path.exists(), path)
 
+    def test_monitor_process_sweep_ignores_symlinked_parent_directory(self):
+        monitor = self.root / "usr/local/qcloud/monitor"
+        monitor.parent.mkdir(parents=True)
+        monitor.symlink_to(self.root)
+        other = str(self.root / "usr/sbin/sshd")
+        self.process(900001, other, [other])
+        result = self.run_shell(
+            r"""
+            remove_path() { :; }
+            remove_empty_dir() { :; }
+            stop_agent_processes() { record "sweep $*"; agent_processes "$@" >/dev/null || return 1; }
+            INCLUDE_MONITOR=1
+            uninstall_monitor
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sweep = [event for event in self.events.read_text().splitlines() if event.startswith("sweep ")]
+        self.assertEqual(len(sweep), 1)
+        self.assertNotIn(f" {monitor} ", sweep[0] + " ")
+        self.assertIn(f"{monitor}/barad", sweep[0])
+
+
 class ComponentTests(UtsFixture):
     def test_timeout_stops_component_cleanup_before_later_steps(self):
+        self.enable_proc()
         for component in ("yunjing", "monitor"):
             for failing in ("remove_paths",):
                 for status in (124, 137, 143):
                     with self.subTest(component=component, failing=failing, status=status):
                         result = self.run_shell(
                             "INCLUDE_MONITOR=1\n"
+                            + "stop_agent_processes() { :; }\n"
                             + "remove_paths() { record remove; }\n"
                             + f"{failing}() {{ record timed-out; return {status}; }}\n"
                             + f"uninstall_{component}\n"
@@ -304,6 +334,7 @@ class ComponentTests(UtsFixture):
         before = self.file_snapshot()
         result = self.run_shell(
             r"""
+            stop_agent_processes() { record "stop-processes $*"; }
             uninstall_monitor
             """
         )

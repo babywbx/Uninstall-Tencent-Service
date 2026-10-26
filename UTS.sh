@@ -10,6 +10,7 @@ TIMEOUT_KILL=(-k 5)
 FAILURES=0
 RUN_PID=""
 LOCK_DIR="/run/uts.lock"
+PROC_ROOT="/proc"
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
 YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
 YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup)
@@ -66,12 +67,12 @@ ${SCRIPT_NAME} ${VERSION}
 选项：
   -y, --yes                跳过确认提示（没有终端时必须使用）
       --include-monitor    同时卸载云监控（BaradAgent 和 Sgagent）
-      --dry-run            只预览将要删除的内容，不做任何修改
+      --dry-run            只预览将要停止和删除的内容，不做任何修改
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
   -h, --help               显示本帮助
 
-主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再删除并
-验证剩余内容。
+主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再停止、
+删除并验证剩余内容。
 运行前请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。
 
 退出码：
@@ -91,12 +92,12 @@ Usage: ./UTS.sh [options]
 Options:
   -y, --yes                Skip the confirmation prompt (required without a terminal)
       --include-monitor    Also uninstall Cloud Monitor (BaradAgent and Sgagent)
-      --dry-run            Show what would be removed, change nothing
+      --dry-run            Show what would be stopped or removed, change nothing
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
   -h, --help               Show this help message
 
 Host Security (YunJing) is always uninstalled. Runs the official uninstallers found
-on the host, then removes and verifies the remnants locally.
+on the host, then stops, removes and verifies the remnants locally.
 Disable Agent uninstall protection in the Host Security console before running.
 
 Exit status:
@@ -174,10 +175,11 @@ require_linux() {
 
 prepare_runtime() {
   local tool=""
-  for tool in awk stat find timeout flock; do
+  for tool in awk readlink stat find timeout flock; do
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
   timeout -k 1 1 true 2>/dev/null || die "GNU timeout with -k is required. Install coreutils." "需要支持 -k 的 GNU timeout，请安装 coreutils。"
+  [[ -r "${PROC_ROOT}/self/status" ]] || die "A readable Linux /proc is required." "需要可读的 Linux /proc。"
   [[ "${DRY_RUN}" -eq 0 ]] || return 0
   [[ -d /run ]] || LOCK_DIR="/var/run/uts.lock"
   if [[ ! -e "${LOCK_DIR}" && ! -L "${LOCK_DIR}" ]]; then
@@ -334,6 +336,121 @@ remove_empty_dir() {
   run rmdir -- "${path}" || return $?
 }
 
+path_in_dirs() {
+  local executable="$1" dir=""
+  shift
+  for dir in "$@"; do
+    [[ "${executable}" == "${dir}/"* ]] && return 0
+  done
+  return 1
+}
+
+resolved_path() {
+  local base="$1" rest="" real="" part=""
+  [[ "${base}" == /* ]] || return 1
+  while [[ "${base}" != / && ! -e "${base}" && ! -L "${base}" ]]; do
+    rest="/${base##*/}${rest}"
+    base="${base%/*}"
+    base="${base:-/}"
+  done
+  real="$(readlink -f -- "${base}" 2>/dev/null)" || return 1
+  while [[ -n "${rest}" ]]; do
+    rest="${rest#/}"
+    part="${rest%%/*}"
+    if [[ "${rest}" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    case "${part}" in
+      ''|.) ;;
+      ..) real="${real%/*}"; real="${real:-/}" ;;
+      *) real="${real%/}/${part}" ;;
+    esac
+    if [[ -e "${real}" || -L "${real}" ]]; then
+      real="$(readlink -f -- "${real}" 2>/dev/null)" || return 1
+    fi
+  done
+  printf '%s\n' "${real}"
+}
+
+with_real_paths() {
+  local dir="" real=""
+  for dir in "$@"; do
+    printf '%s\n' "${dir}"
+    real="$(resolved_path "${dir}")" || continue
+    [[ "${real}" == "${dir}" ]] || printf '%s\n' "${real}"
+  done
+}
+
+is_agent_process() {
+  local executable="$2"
+  shift 2
+  path_in_dirs "${executable}" "$@"
+}
+
+agent_processes() {
+  local entry="" pid="" executable="" argv0="" rc=0 match_rc=0
+  local -a dirs=()
+  [[ -r "${PROC_ROOT}/self/status" ]] || { warn "Cannot inspect /proc." "无法检查 /proc。"; return 1; }
+  while IFS= read -r entry; do dirs+=("${entry}"); done < <(with_real_paths "$@")
+  for entry in "${PROC_ROOT}"/[0-9]*; do
+    [[ -d "${entry}" ]] || continue
+    pid="${entry##*/}"
+    [[ "${pid}" != "$$" ]] || continue
+    if [[ ! -r "${entry}/cmdline" ]]; then
+      if [[ -d "${entry}" ]]; then
+        warn "Cannot inspect command line for PID ${pid}." "无法检查 PID ${pid} 的命令行。"
+        rc=1
+      fi
+      continue
+    fi
+    argv0=""
+    IFS= read -r -d '' argv0 <"${entry}/cmdline" 2>/dev/null || true
+    [[ -n "${argv0}" ]] || continue
+    executable="$(readlink -- "${entry}/exe" 2>/dev/null)" || {
+      argv0=""
+      IFS= read -r -d '' argv0 <"${entry}/cmdline" 2>/dev/null || true
+      if [[ -n "${argv0}" ]]; then
+        warn "Cannot inspect executable for PID ${pid}." "无法检查 PID ${pid} 的可执行文件。"
+        rc=1
+      fi
+      continue
+    }
+    executable="${executable% (deleted)}"
+    match_rc=0
+    is_agent_process "${entry}" "${executable}" "${dirs[@]}" || match_rc=$?
+    if [[ "${match_rc}" -ne 0 ]]; then
+      [[ "${match_rc}" -eq 1 ]] || rc=1
+      continue
+    fi
+    printf '%s|%s\n' "${pid}" "${executable}"
+  done
+  return "${rc}"
+}
+
+signal_agent_processes() {
+  local signal="$1" targets="$2" pid="" expected=""
+  while IFS='|' read -r pid expected; do
+    [[ -n "${pid}" ]] || continue
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      printf '[DRY-RUN] kill -%s %s (%s)\n' "${signal}" "${pid}" "${expected}" >&3
+    else
+      kill -"${signal}" "${pid}" 2>/dev/null || warn "Cannot signal PID ${pid}: ${expected}." "无法向 PID ${pid} 发送信号：${expected}。"
+    fi
+  done <<<"${targets}"
+}
+
+show_processes() {
+  local pid="" executable=""
+  while IFS='|' read -r pid executable; do
+    printf '  PID %-8s %s\n' "${pid}" "${executable}" >&2
+  done <<<"$1"
+}
+
+stop_agent_processes() {
+  local targets=""
+  targets="$(agent_processes "$@")" || return 1
+  [[ -n "${targets}" ]] || return 0
+  signal_agent_processes TERM "${targets}"
+}
+
 remove_paths() {
   local kind="$1" path="" rc=0
   shift
@@ -358,6 +475,7 @@ uninstall_yunjing() {
     warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
     return "${official_rc}"
   fi
+  stop_agent_processes "${YUNJING_DIRS[@]}" || return 1
   remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   remove_paths file "${YUNJING_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   [[ "${rc}" -eq 0 ]] || return 1
@@ -379,6 +497,7 @@ uninstall_monitor() {
     path_present "${path}" || continue
     run_local_script "${path}" "Sgagent " || return $?
   done
+  stop_agent_processes "${removals[@]}" || return 1
   remove_paths tree "${removals[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   for dir in "${MONITOR_DIRS[@]}"; do
     remove_empty_dir "${dir}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
@@ -388,13 +507,21 @@ uninstall_monitor() {
 }
 
 verify_uninstall() {
-  local path="" found=0
+  local path="" targets="" found=0
+  local -a dirs=()
   while IFS= read -r path; do
+    dirs+=("${path}")
     if path_present "${path}"; then
       warn "Installation path remains: ${path}." "安装路径仍然存在：${path}。"
       found=1
     fi
   done < <(selected_dirs)
+  targets="$(agent_processes "${dirs[@]}")" || return 1
+  if [[ -n "${targets}" ]]; then
+    warn "Agent processes remain:" "仍有 Agent 进程："
+    show_processes "${targets}"
+    found=1
+  fi
   while IFS= read -r path; do
     [[ -n "${path}" ]] || continue
     if path_present "${path}"; then
@@ -466,7 +593,7 @@ main() {
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     section "Verification" "验证"
     if verify_uninstall; then
-      ok "No agent files remain." "未发现 Agent 文件残留。"
+      ok "No agent files or processes remain." "未发现 Agent 文件或进程残留。"
     else
       verify_rc=$?
     fi

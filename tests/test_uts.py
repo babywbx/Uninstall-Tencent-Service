@@ -69,6 +69,21 @@ class UtsFixture(unittest.TestCase):
             for path in self.root.rglob("*")
         }
 
+    def enable_proc(self):
+        (self.root / "proc/self").mkdir(exist_ok=True)
+        (self.root / "proc/self/status").touch()
+
+    def process(self, pid, executable, arguments, started=100):
+        proc = self.root / f"proc/{pid}"
+        proc.mkdir(parents=True)
+        (self.root / "proc/self").mkdir(exist_ok=True)
+        (self.root / "proc/self/status").touch()
+        (proc / "exe").symlink_to(os.path.realpath(executable))
+        (proc / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in arguments) + b"\0")
+        fields = ["S", *(["0"] * 18), str(started)]
+        (proc / "stat").write_text(f"{pid} (agent worker) {' '.join(fields)}\n")
+        return proc
+
     def vendor_script(self, path, body):
         path.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(body, bytes):
@@ -299,6 +314,7 @@ class MainTests(UtsFixture):
         self.vendor_script(stargate / "admin/uninstall.sh", "#!/bin/bash\nexit 0\n")
         barad = self.root / "usr/local/qcloud/monitor/barad"
         self.vendor_script(barad / "admin/uninstall.sh", "#!/bin/bash\nexit 0\n")
+        self.enable_proc()
         before = self.file_snapshot()
         result = self.run_shell(
             self.real_function("run")
@@ -415,7 +431,7 @@ class MainTests(UtsFixture):
             "==> Host Security agent (YunJing)",
             "==> Cloud Monitor (BaradAgent / Sgagent)",
             "==> Verification",
-            "[ OK ] No agent files remain.",
+            "[ OK ] No agent files or processes remain.",
             "[ OK ] Uninstall-Tencent-Service: local uninstall verified.",
         ]
         for reply, proceeds in (("y", True), ("yes", True), ("YES", True), ("n", False), ("", False), ("yess", False)):
@@ -557,6 +573,8 @@ class MainTests(UtsFixture):
                             stubs += f"uninstall_{other}() {{ record {other}; }}\n"
                     result = self.run_shell(
                         stubs
+                        + "agent_processes() { :; }\n"
+                        + "stop_agent_processes() { :; }\n"
                         + f"remove_paths() {{ record cleanup-timeout; return {status}; }}\n"
                         + "verify_uninstall() { record verify; }\n"
                         + "main --yes --include-monitor"
@@ -590,6 +608,10 @@ class MainTests(UtsFixture):
 
 
 class VerifyTests(UtsFixture):
+    def setUp(self):
+        super().setUp()
+        self.enable_proc()
+
     def verify(self, stubs=""):
         return stubs + "\nINCLUDE_MONITOR=1\nverify_uninstall\n"
 
@@ -600,7 +622,7 @@ class VerifyTests(UtsFixture):
         )
 
     def test_clean_root_passes_verification(self):
-        result = self.run_shell(self.verify())
+        result = self.run_shell(self.verify("agent_processes() { :; }"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.events.read_text(), "")
@@ -611,6 +633,23 @@ class VerifyTests(UtsFixture):
         result = self.run_shell(self.verify())
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(f"Installation path remains: {stargate}.", result.stderr)
+
+    def test_remaining_agent_process_fails_verification(self):
+        agent = str(self.root / "usr/local/qcloud/stargate/bin/sgagent64")
+        self.process(900001, agent, [agent, "-d"])
+        result = self.run_shell(self.verify())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Agent processes remain:", result.stderr)
+        self.assertIn("PID 900001", result.stderr)
+        self.assertIn("sgagent64", result.stderr)
+
+    def test_unreadable_cmdline_is_not_successful_verification(self):
+        agent = str(self.root / "usr/local/qcloud/YunJing/YDService")
+        (self.process(900002, agent, [agent]) / "cmdline").unlink()
+        result = self.run_shell(self.verify())
+        self.assert_failed(result)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Cannot inspect command line for PID 900002.", result.stderr)
 
     def test_leftover_symlink_fails_verification(self):
         link = self.root / "tmp/yunjing_install"
