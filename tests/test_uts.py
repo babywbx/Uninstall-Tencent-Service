@@ -117,6 +117,8 @@ class UtsFixture(unittest.TestCase):
         """
         overrides = r"""
             UI_LANG=en
+            WORKDIR="$UTS_TEST_ROOT/tmp"
+            cleanup() { :; }
             require_root() { :; }
             prepare_runtime() { :; }
             run() { record "run $*"; return 0; }

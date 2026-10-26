@@ -4,9 +4,11 @@ set -euo pipefail
 
 readonly SCRIPT_NAME="Uninstall-Tencent-Service"
 readonly VERSION="1.0.0"
+WORKDIR=""
 COMMAND_TIMEOUT=120
 TIMEOUT_KILL=(-k 5)
 FAILURES=0
+LOCK_DIR="/run/uts.lock"
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
 YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
 YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup)
@@ -26,6 +28,12 @@ else
   C_BLUE=''; C_GREEN=''; C_YELLOW=''; C_RED=''
 fi
 readonly C_RESET C_BOLD C_BLUE C_GREEN C_YELLOW C_RED
+
+cleanup() {
+  if [[ -n "${WORKDIR}" ]]; then
+    rm -rf -- "${WORKDIR}"
+  fi
+}
 
 msg() {
   MSG="$1"
@@ -117,7 +125,7 @@ command_exists() {
 run() {
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     local rc=0 command=""
-    timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null || rc=$?
+    timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null 9>&- || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
       command="$(printf ' %q' "$@")"
       warn "Command failed (${rc}):${command}" "命令失败（${rc}）：${command# }"
@@ -138,10 +146,21 @@ require_linux() {
 
 prepare_runtime() {
   local tool=""
-  for tool in awk timeout; do
+  for tool in awk stat timeout flock; do
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
   timeout -k 1 1 true 2>/dev/null || die "GNU timeout with -k is required. Install coreutils." "需要支持 -k 的 GNU timeout，请安装 coreutils。"
+  [[ "${DRY_RUN}" -eq 0 ]] || return 0
+  [[ -d /run ]] || LOCK_DIR="/var/run/uts.lock"
+  if [[ ! -e "${LOCK_DIR}" && ! -L "${LOCK_DIR}" ]]; then
+    mkdir -m 700 -- "${LOCK_DIR}" || die "Cannot create ${LOCK_DIR}." "无法创建 ${LOCK_DIR}。"
+  fi
+  [[ -d "${LOCK_DIR}" && ! -L "${LOCK_DIR}" ]] || die "Unsafe lock directory: ${LOCK_DIR}." "锁目录不安全：${LOCK_DIR}。"
+  [[ "$(stat -c '%u:%a' "${LOCK_DIR}")" == 0:700 ]] || die "Lock directory must be owned by root with mode 700." "锁目录必须属于 root 且权限为 700。"
+  exec 9<"${LOCK_DIR}"
+  flock -n 9 || die "Another UTS instance is already running." "已有另一个 UTS 实例在运行。"
+  WORKDIR="$(mktemp -d /tmp/uts.XXXXXX)" || die "Cannot create a private work directory." "无法创建私有工作目录。"
+  trap cleanup EXIT
 }
 
 require_root() {

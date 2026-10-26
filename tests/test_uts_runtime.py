@@ -19,9 +19,55 @@ if GNU_TIMEOUT:
     except (OSError, subprocess.TimeoutExpired):
         GNU_TIMEOUT = None
 
+FLOCK = shutil.which("flock")
+
 
 @unittest.skipUnless(GNU_TIMEOUT, "GNU or uutils timeout is required for real runtime tests")
 class RuntimeTests(UtsFixture):
+    @unittest.skipUnless(FLOCK, "flock is required for the real lock test")
+    def test_lock_rejects_inheriting_instance_and_releases_on_exit(self):
+        stat_override = r'''
+            stat() {
+              if [[ "$2" == %u:%a && "${@: -1}" == "$LOCK_DIR" ]]; then
+                printf '0:700\n'
+              else
+                command stat "$@"
+              fi
+            }
+        '''
+        timeout_override = f"timeout() {{ {shlex.quote(GNU_TIMEOUT)} \"$@\"; }}\n"
+        contender = self.base / "contender.sh"
+        contender.write_text(
+            f"source {shlex.quote(str(self.source))}\n"
+            + stat_override
+            + timeout_override
+            + 'prepare_runtime\nprintf "lock acquired\\n"\n'
+        )
+        runtime = (
+            self.real_function("prepare_runtime")
+            + self.real_function("cleanup")
+            + stat_override
+            + timeout_override
+            + "unset -f rm\n"
+        )
+        result = self.run_shell(
+            runtime
+            + 'prepare_runtime\nprintf "parent locked\\n"\n'
+            + "child_rc=0\n"
+            + f"{shlex.quote(BASH)} {shlex.quote(str(contender))} || child_rc=$?\n"
+            + '[[ "$child_rc" -eq 1 ]]\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("parent locked", result.stdout)
+        self.assertNotIn("lock acquired", result.stdout)
+        self.assertIn("[FAIL] 已有另一个 UTS 实例在运行。", result.stderr)
+        self.assertFalse(list((self.root / "tmp").glob("uts.*")))
+
+        reacquired = self.run_shell(runtime + 'prepare_runtime\nprintf "reacquired\\n"\n')
+        self.assertEqual(reacquired.returncode, 0, reacquired.stdout + reacquired.stderr)
+        self.assertIn("reacquired", reacquired.stdout)
+        self.assertFalse(list((self.root / "tmp").glob("uts.*")))
+
     def test_real_timeout_stops_command(self):
         binaries = self.base / "bin"
         binaries.mkdir()
