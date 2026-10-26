@@ -30,7 +30,7 @@ stat() {
 EXECUTE = 'timeout() { record "timeout $*"; shift 3; "$@"; }\n'
 CJK = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 MESSAGE_CALL = re.compile(
-    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|preview|section)'
+    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|preview|section|record_failure)'
     r'\s+("[^"]*")((?:\s+"[^"]*")*)'
 )
 
@@ -195,6 +195,7 @@ class MainTests(UtsFixture):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("用法：", result.stdout)
+        self.assertIn("--include-monitor", result.stdout)
 
     def test_options_are_validated(self):
         for arguments, accepted in (
@@ -250,7 +251,7 @@ class MainTests(UtsFixture):
         chinese = invoke(["--help"]).stdout
         self.assertIn("Usage:", english)
         options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
-        self.assertGreaterEqual(len(options), 4)
+        self.assertGreaterEqual(len(options), 5)
         self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
         for code in ("0", "1", "124, 137", "130, 143"):
             self.assertRegex(english, rf"(?m)^  {code}\s+\w")
@@ -294,26 +295,35 @@ class MainTests(UtsFixture):
     def test_dry_run_previews_without_changing_files(self):
         yunjing = self.root / "usr/local/qcloud/YunJing"
         self.vendor_script(yunjing / "uninst.sh", "#!/bin/sh\nexit 0\n")
+        stargate = self.root / "usr/local/qcloud/stargate"
+        self.vendor_script(stargate / "admin/uninstall.sh", "#!/bin/bash\nexit 0\n")
+        barad = self.root / "usr/local/qcloud/monitor/barad"
+        self.vendor_script(barad / "admin/uninstall.sh", "#!/bin/bash\nexit 0\n")
         before = self.file_snapshot()
         result = self.run_shell(
             self.real_function("run")
             + r"""
             stat() { printf '0\n'; }
             verify_uninstall() { record verify; }
-            main --dry-run
+            main --dry-run --include-monitor
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.events.read_text(), "")
         previews = [
             f"[DRY-RUN] would run official {yunjing}/uninst.sh",
+            f"[DRY-RUN] would run official BaradAgent {barad}/admin/uninstall.sh",
+            f"[DRY-RUN] would run official Sgagent {stargate}/admin/uninstall.sh",
             f"[DRY-RUN] rm -rf -- {yunjing}",
+            f"[DRY-RUN] rm -rf -- {stargate}",
+            f"[DRY-RUN] rm -rf -- {barad}",
         ]
         positions = [result.stdout.find(preview) for preview in previews]
         self.assertNotIn(-1, positions, result.stdout)
-        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(positions[:3], sorted(positions[:3]))
         steps = [
             "==> Host Security agent (YunJing)",
+            "==> Cloud Monitor (BaradAgent / Sgagent)",
             "[ OK ] Dry run finished; nothing was changed.",
         ]
         positions = [result.stdout.find(line) for line in steps]
@@ -327,12 +337,14 @@ class MainTests(UtsFixture):
 
     STUBBED_MAIN = r"""
         uninstall_yunjing() { section "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"; record yunjing; }
+        uninstall_monitor() { section "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"; record monitor; }
         verify_uninstall() { record verify; }
     """
 
     def test_confirmation_needs_a_terminal_unless_yes_or_dry_run(self):
         for options, code, events in (
             ("", 1, []),
+            ("--include-monitor", 1, []),
             ("--yes", 0, ["yunjing", "verify"]),
             ("--dry-run", 0, ["yunjing"]),
         ):
@@ -397,9 +409,11 @@ class MainTests(UtsFixture):
 
     def test_confirmation_accepts_only_yes(self):
         (self.root / "usr/local/qcloud/YunJing").mkdir(parents=True)
+        (self.root / "usr/local/qcloud/stargate").mkdir(parents=True)
         plan = ["[INFO] System: Debian GNU/Linux 12 (bookworm), x86_64"]
         summary = [
             "==> Host Security agent (YunJing)",
+            "==> Cloud Monitor (BaradAgent / Sgagent)",
             "==> Verification",
             "[ OK ] No agent files remain.",
             "[ OK ] Uninstall-Tencent-Service: local uninstall verified.",
@@ -407,7 +421,7 @@ class MainTests(UtsFixture):
         for reply, proceeds in (("y", True), ("yes", True), ("YES", True), ("n", False), ("", False), ("yess", False)):
             for mode in ("stdin", "stdout"):
                 with self.subTest(reply=reply, mode=mode):
-                    result = self.run_shell(self.STUBBED_MAIN + "main\n", **self.answer(reply, mode))
+                    result = self.run_shell(self.STUBBED_MAIN + "main --include-monitor\n", **self.answer(reply, mode))
                     if mode == "stdout":
                         output = self.terminal_text("Uninstall-Tencent-Service: " if proceeds else "[y/N]")
                         self.assertIn("\nContinue? [y/N] ", output)
@@ -419,7 +433,7 @@ class MainTests(UtsFixture):
                     self.assertEqual(positions, sorted(positions))
                     if proceeds:
                         self.assertEqual(result.returncode, 0, output + result.stderr)
-                        self.assertEqual(self.events.read_text().splitlines(), ["yunjing", "verify"])
+                        self.assertEqual(self.events.read_text().splitlines(), ["yunjing", "monitor", "verify"])
                     else:
                         self.assertEqual(result.returncode, 1, output + result.stderr)
                         self.assertEqual(self.events.read_text(), "")
@@ -472,20 +486,22 @@ class MainTests(UtsFixture):
 
     def test_dry_run_with_a_failed_step_is_not_reported_as_finished(self):
         result = self.run_shell(
-            self.STUBBED_MAIN + "uninstall_yunjing() { return 1; }\nmain --dry-run\n"
+            self.STUBBED_MAIN + "uninstall_monitor() { return 1; }\nmain --dry-run --include-monitor\n"
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertNotIn("Dry run finished", result.stdout)
-        self.assertIn("Host Security agent (YunJing) uninstall is incomplete (1).", result.stderr)
+        self.assertIn("Cloud Monitor (BaradAgent / Sgagent) uninstall is incomplete (1).", result.stderr)
         self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
 
     def test_chinese_output_has_no_untranslated_lines(self):
+        (self.root / "usr/local/qcloud/stargate").mkdir(parents=True)
         for language in ("zh", "en"):
             with self.subTest(language=language):
                 result = self.run_shell(
                     self.STUBBED_MAIN
+                    + 'uninstall_monitor() { section "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"; return 1; }\n'
                     + "verify_uninstall() { warn \"Agent processes remain:\" \"仍有 Agent 进程：\"; return 1; }\n"
-                    + f"UI_LANG={language}\nmain --yes\n"
+                    + f"UI_LANG={language}\nmain --yes --include-monitor\n"
                 )
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
@@ -495,62 +511,92 @@ class MainTests(UtsFixture):
                     self.assertEqual(lines, english)
                 else:
                     self.assertEqual(english, [], result.stdout + result.stderr)
+                    self.assertIn("云监控（BaradAgent / Sgagent）卸载未完成（1）。", result.stderr)
                     self.assertIn("Uninstall-Tencent-Service：未完成", result.stderr)
 
-    def test_yunjing_failure_stops_before_verification(self):
+    def test_yunjing_failure_skips_optional_components(self):
         for status in (1, 7, 124, 137):
             with self.subTest(status=status):
                 result = self.run_shell(
                     f"uninstall_yunjing() {{ record yunjing; return {status}; }}\n"
                     + r"""
+                    uninstall_monitor() { record monitor; }
                     verify_uninstall() { record verify; }
                     """
-                    + "main --yes\n"
+                    + "main --yes --include-monitor\n"
                 )
                 self.assertEqual(result.returncode, status if status in (124, 137) else 1, result.stdout + result.stderr)
                 self.assertEqual(self.events.read_text().splitlines(), ["yunjing"])
                 self.assertIn(f"Host Security agent (YunJing) uninstall is incomplete ({status})", result.stderr)
+                self.assertIn("optional components were not processed", result.stderr)
                 self.assertNotIn("local uninstall verified", result.stdout)
                 self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
 
-    def test_cleanup_timeout_is_preserved_through_real_component_and_main(self):
+    def test_optional_component_timeout_stops_remaining_work(self):
         for status in (124, 137, 143):
             with self.subTest(status=status):
                 result = self.run_shell(
-                    f"remove_paths() {{ record cleanup-timeout; return {status}; }}\n"
-                    + "verify_uninstall() { record verify; }\n"
-                    + "main --yes"
+                    "uninstall_yunjing() { :; }\n"
+                    f"uninstall_monitor() {{ record monitor; return {status}; }}\n"
+                    "verify_uninstall() { record verify; }\n"
+                    "main --yes --include-monitor"
                 )
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
-                self.assertEqual(self.events.read_text().splitlines(), ["cleanup-timeout"])
+                self.assertEqual(self.events.read_text().splitlines(), ["monitor"])
                 self.assertNotIn("local uninstall verified", result.stdout)
+                self.assertIn(f"uninstall is incomplete ({status})", result.stderr)
+                self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
 
-    def test_verified_only_when_verification_passed(self):
-        for verify_rc in (0, 1):
-            with self.subTest(verify_rc=verify_rc):
-                result = self.run_shell(
-                    "uninstall_yunjing() { :; }\n"
-                    + f"verify_uninstall() {{ record verify; return {verify_rc}; }}\n"
-                    + "main --yes\n"
-                )
-                self.assertEqual(self.events.read_text().splitlines(), ["verify"])
-                if verify_rc:
-                    self.assert_failed(result)
-                    self.assertEqual(result.returncode, 1, result.stderr)
-                    self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
-                else:
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn("Uninstall-Tencent-Service: local uninstall verified.", result.stdout)
+    def test_cleanup_timeout_is_preserved_through_real_component_and_main(self):
+        for component in ("yunjing", "monitor"):
+            for status in (124, 137, 143):
+                with self.subTest(component=component, status=status):
+                    stubs = ""
+                    for other in ("yunjing", "monitor"):
+                        if other != component:
+                            stubs += f"uninstall_{other}() {{ record {other}; }}\n"
+                    result = self.run_shell(
+                        stubs
+                        + f"remove_paths() {{ record cleanup-timeout; return {status}; }}\n"
+                        + "verify_uninstall() { record verify; }\n"
+                        + "main --yes --include-monitor"
+                    )
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    previous = {"yunjing": [], "monitor": ["yunjing"]}
+                    self.assertEqual(self.events.read_text().splitlines(), previous[component] + ["cleanup-timeout"])
+                    self.assertNotIn("local uninstall verified", result.stdout)
+
+    def test_verified_only_when_no_step_or_verification_failed(self):
+        for failing in (None, "uninstall_monitor"):
+            for verify_rc in (0, 1):
+                with self.subTest(failing=failing, verify_rc=verify_rc):
+                    script = "uninstall_yunjing() { :; }\nuninstall_monitor() { :; }\n"
+                    if failing:
+                        script += f"{failing}() {{ record failed-{failing}; return 1; }}\n"
+                    result = self.run_shell(
+                        script
+                        + f"verify_uninstall() {{ record verify; return {verify_rc}; }}\n"
+                        + "main --yes --include-monitor\n"
+                    )
+                    expected = ([f"failed-{failing}"] if failing else []) + ["verify"]
+                    self.assertEqual(self.events.read_text().splitlines(), expected)
+                    if failing or verify_rc:
+                        self.assert_failed(result)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn("Uninstall-Tencent-Service: local uninstall verified.", result.stdout)
 
 
 class VerifyTests(UtsFixture):
     def verify(self, stubs=""):
-        return stubs + "\nverify_uninstall\n"
+        return stubs + "\nINCLUDE_MONITOR=1\nverify_uninstall\n"
 
     def main(self):
         return (
             'timeout() { shift 3; "$@"; }\n'
-            "main --yes\n"
+            "main --yes --include-monitor\n"
         )
 
     def test_clean_root_passes_verification(self):
@@ -560,11 +606,11 @@ class VerifyTests(UtsFixture):
         self.assertEqual(self.events.read_text(), "")
 
     def test_remaining_installation_directory_fails_verification(self):
-        yunjing = self.root / "usr/local/qcloud/YunJing"
-        yunjing.mkdir(parents=True)
+        stargate = self.root / "usr/local/qcloud/stargate"
+        stargate.mkdir(parents=True)
         result = self.run_shell(self.verify())
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(f"Installation path remains: {yunjing}.", result.stderr)
+        self.assertIn(f"Installation path remains: {stargate}.", result.stderr)
 
     def test_leftover_symlink_fails_verification(self):
         link = self.root / "tmp/yunjing_install"

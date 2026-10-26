@@ -7,6 +7,34 @@ from test_uts import EXECUTE, ROOT_STAT, UtsFixture
 
 
 ELF = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 56
+MOCKS = r"""
+    stat() { printf '0\n'; }
+    run() {
+      record "run $*"
+      case "$1" in
+        rm|rmdir|cp|mv|chmod) command "$@" ;;
+      esac
+    }
+    INCLUDE_MONITOR=1
+"""
+LATER_STEPS = r"""
+    remove_path() { record "remove $1"; }
+    remove_empty_dir() { record "remove-empty $1"; }
+    INCLUDE_MONITOR=1
+"""
+
+
+def install_monitor(root, prefix, scripts=True):
+    monitor = root / prefix / "monitor"
+    stargate = root / prefix / "stargate"
+    for directory in (monitor / "barad/admin", stargate / "admin", stargate / "bin"):
+        directory.mkdir(parents=True, exist_ok=True)
+    (stargate / "bin/sgagent64").touch()
+    if scripts:
+        for script in (monitor / "barad/admin/uninstall.sh", stargate / "admin/uninstall.sh"):
+            script.write_text("#!/bin/bash\nexit 0\n")
+            script.chmod(0o755)
+    return monitor, stargate
 
 
 class YunjingTests(UtsFixture):
@@ -75,7 +103,7 @@ class YunjingTests(UtsFixture):
             [self.official(script, "timeout -k 5 120"), *self.local_cleanup()],
         )
 
-    def test_official_uninstall_continues_to_verification(self):
+    def test_verified_official_uninstall_continues_selected_components(self):
         self.vendor_script(
             self.primary / "uninst.sh",
             "#!/bin/bash\nprintf 'remove YunJing software success\\n'\n",
@@ -83,12 +111,13 @@ class YunjingTests(UtsFixture):
         result = self.run_shell(
             self.local_stubs + ROOT_STAT + EXECUTE + self.real_function("run")
             + r"""
+            uninstall_monitor() { record monitor; }
             verify_uninstall() { record verify; }
-            main --yes
+            main --yes --include-monitor
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.events.read_text().splitlines()[-1:], ["verify"])
+        self.assertEqual(self.events.read_text().splitlines()[-2:], ["monitor", "verify"])
         self.assertIn("local uninstall verified", result.stdout)
 
     def test_official_uninstaller_failure_stops_local_cleanup(self):
@@ -141,23 +170,183 @@ class YunjingTests(UtsFixture):
         self.assertFalse(self.vendor_log.exists())
         self.assertNotIn("sleep ", self.events.read_text())
 
+class MonitorTests(UtsFixture):
+    def setUp(self):
+        super().setUp()
+
+    def reset(self):
+        for prefix in ("usr/local/qcloud", "var/lib/qcloud"):
+            shutil.rmtree(self.root / prefix, ignore_errors=True)
+        self.vendor_log.unlink(missing_ok=True)
+
+    def leftovers(self):
+        paths = [
+            self.root / name
+            for name in (
+                "tmp/stargate.lock",
+                "var/run/stargate.tencentyun.pid",
+                "var/run/stargat.tencentyun.pid",
+            )
+        ]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n")
+        return paths
+
+    def test_official_uninstallers_run_barad_then_sgagent_from_their_directories(self):
+        for prefix in ("usr/local/qcloud", "var/lib/qcloud"):
+            with self.subTest(prefix=prefix):
+                self.reset()
+                monitor, stargate = install_monitor(self.root, prefix, scripts=False)
+                barad = self.vendor_script(monitor / "barad/admin/uninstall.sh", self.logging_script("barad"))
+                sgagent = self.vendor_script(stargate / "admin/uninstall.sh", self.logging_script("sgagent"))
+                result = self.run_shell(
+                    ROOT_STAT + EXECUTE + self.real_function("run") + LATER_STEPS + "uninstall_monitor\n"
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(
+                    self.vendor_log.read_text(),
+                    f"barad {monitor}/barad/admin\nsgagent {stargate}/admin\n",
+                )
+                events = self.events.read_text().splitlines()
+                self.assertEqual(
+                    events[:2],
+                    [
+                        self.official(barad, "timeout -k 5 120"),
+                        self.official(sgagent, "timeout -k 5 120"),
+                    ],
+                )
+
+    def test_official_failure_stops_monitor_cleanup(self):
+        for name, payload, status in (
+            ("unknown format", b"MZ\x90\x00 not a shell script\n", 1),
+            ("exit 7", b"#!/bin/bash\nexit 7\n", 7),
+            ("exit 124", b"#!/bin/bash\nexit 124\n", 124),
+        ):
+            with self.subTest(case=name):
+                self.reset()
+                monitor, stargate = install_monitor(self.root, "usr/local/qcloud", scripts=False)
+                barad = self.vendor_script(monitor / "barad/admin/uninstall.sh", payload)
+                self.vendor_script(stargate / "admin/uninstall.sh", self.logging_script("sgagent"))
+                result = self.run_shell(
+                    ROOT_STAT + EXECUTE + self.real_function("run") + LATER_STEPS + "uninstall_monitor\n"
+                )
+                barad_run = [] if name == "unknown format" else [self.official(barad, "timeout -k 5 120")]
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertFalse(self.vendor_log.exists())
+                self.assertEqual(self.events.read_text().splitlines(), barad_run)
+                self.assertTrue(stargate.is_dir())
+
+    def test_local_cleanup_removes_each_install_root(self):
+        for prefix in ("usr/local/qcloud", "var/lib/qcloud"):
+            with self.subTest(prefix=prefix):
+                monitor, stargate = install_monitor(self.root, prefix)
+                result = self.run_shell(MOCKS + "uninstall_monitor")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("[WARN]", result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), [
+                    self.official(monitor / "barad/admin/uninstall.sh"),
+                    self.official(stargate / "admin/uninstall.sh"),
+                    f"run rm -rf -- {stargate}",
+                    f"run rm -rf -- {monitor}/barad",
+                    f"run rmdir -- {monitor}",
+                ])
+                self.assertFalse(monitor.exists())
+                self.assertFalse(stargate.exists())
+
+    def test_monitor_directory_with_other_content_is_kept_without_failure(self):
+        for other in ("other/agent.conf", ".cache"):
+            with self.subTest(other=other):
+                self.reset()
+                monitor, stargate = install_monitor(self.root, "usr/local/qcloud")
+                keep = monitor / other
+                keep.parent.mkdir(parents=True, exist_ok=True)
+                keep.write_text("keep\n")
+                result = self.run_shell(MOCKS + "uninstall_monitor")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("[WARN]", result.stderr)
+                events = self.events.read_text()
+                self.assertIn(f"run rm -rf -- {monitor}/barad\n", events)
+                self.assertNotIn("rmdir", events)
+                self.assertEqual([path.name for path in monitor.iterdir()], [other.split("/")[0]])
+                self.assertEqual(keep.read_text(), "keep\n")
+                self.assertFalse(stargate.exists())
+
+    def test_lock_and_pid_files_are_removed(self):
+        leftovers = self.leftovers()
+        result = self.run_shell(MOCKS + 'WORKDIR="$UTS_TEST_ROOT/tmp"\nuninstall_monitor')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [event for event in self.events.read_text().splitlines() if event.startswith("run rm")],
+            [f"run rm -f -- {path}" for path in leftovers],
+        )
+        for path in leftovers:
+            self.assertFalse(path.exists(), path)
+
 class ComponentTests(UtsFixture):
     def test_timeout_stops_component_cleanup_before_later_steps(self):
-        for status in (124, 137, 143):
-            with self.subTest(status=status):
-                result = self.run_shell(f"remove_paths() {{ record timed-out; return {status}; }}\nuninstall_yunjing\n")
-                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
-                self.assertEqual(self.events.read_text().splitlines(), ["timed-out"])
+        for component in ("yunjing", "monitor"):
+            for failing in ("remove_paths",):
+                for status in (124, 137, 143):
+                    with self.subTest(component=component, failing=failing, status=status):
+                        result = self.run_shell(
+                            "INCLUDE_MONITOR=1\n"
+                            + "remove_paths() { record remove; }\n"
+                            + f"{failing}() {{ record timed-out; return {status}; }}\n"
+                            + f"uninstall_{component}\n"
+                        )
+                        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                        self.assertEqual(self.events.read_text().splitlines(), ["timed-out"])
 
-    def test_selection_helpers_list_yunjing_paths(self):
-        result = self.run_shell("selected_dirs; echo ---; selected_leftovers")
+    def test_optional_components_are_untouched_unless_selected(self):
+        install_monitor(self.root, "usr/local/qcloud")
+        before = self.file_snapshot()
+        result = self.run_shell(
+            r"""
+            uninstall_monitor
+            """
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stderr, "")
-        dirs, leftovers = (part.splitlines() for part in result.stdout.split("---\n"))
-        self.assertEqual(dirs, [
-            str(self.root / "usr/local/qcloud/YunJing"),
-            str(self.root / "var/lib/qcloud/YunJing"),
-            str(self.root / "run/ydeyes"),
-            str(self.root / "var/run/ydeyes"),
-        ])
-        self.assertEqual(leftovers, [str(self.root / "tmp/yunjing_install"), str(self.root / "tmp/yunjing_install_nohup")])
+        self.assertEqual(result.stdout + result.stderr, "")
+        self.assertEqual(self.events.read_text(), "")
+        self.assertEqual(before, self.file_snapshot())
+
+    def test_selection_helpers_follow_component_flags(self):
+        yunjing_dirs = [
+            self.root / "usr/local/qcloud/YunJing",
+            self.root / "var/lib/qcloud/YunJing",
+            self.root / "run/ydeyes",
+            self.root / "var/run/ydeyes",
+        ]
+        monitor_dirs = [
+            self.root / "usr/local/qcloud/stargate",
+            self.root / "var/lib/qcloud/stargate",
+            self.root / "usr/local/qcloud/monitor/barad",
+            self.root / "var/lib/qcloud/monitor/barad",
+        ]
+        yunjing_leftovers = [
+            self.root / "tmp/yunjing_install",
+            self.root / "tmp/yunjing_install_nohup",
+        ]
+        monitor_leftovers = [
+            self.root / "tmp/stargate.lock",
+            self.root / "var/run/stargate.tencentyun.pid",
+            self.root / "var/run/stargat.tencentyun.pid",
+        ]
+        for monitor in (0, 1):
+            with self.subTest(monitor=monitor):
+                result = self.run_shell(
+                    f"INCLUDE_MONITOR={monitor}\n"
+                    "selected_dirs; echo ---; selected_leftovers"
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+                dirs, leftovers = (
+                    part.splitlines() for part in result.stdout.split("---\n")
+                )
+                self.assertEqual(dirs, [str(path) for path in yunjing_dirs + monitor_dirs * monitor])
+                self.assertEqual(
+                    leftovers,
+                    [str(path) for path in yunjing_leftovers + monitor_leftovers * monitor],
+                )

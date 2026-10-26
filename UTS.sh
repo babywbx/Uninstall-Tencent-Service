@@ -13,8 +13,12 @@ LOCK_DIR="/run/uts.lock"
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
 YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
 YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup)
+STARGATE_DIRS=(/usr/local/qcloud/stargate /var/lib/qcloud/stargate)
+MONITOR_DIRS=(/usr/local/qcloud/monitor /var/lib/qcloud/monitor)
+MONITOR_FILES=(/tmp/stargate.lock /var/run/stargate.tencentyun.pid /var/run/stargat.tencentyun.pid)
 
 AUTO_YES=0
+INCLUDE_MONITOR=0
 DRY_RUN=0
 UI_LANG=zh
 MSG=""
@@ -61,11 +65,13 @@ ${SCRIPT_NAME} ${VERSION}
 
 选项：
   -y, --yes                跳过确认提示（没有终端时必须使用）
+      --include-monitor    同时卸载云监控（BaradAgent 和 Sgagent）
       --dry-run            只预览将要删除的内容，不做任何修改
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
   -h, --help               显示本帮助
 
-脚本先运行主机上的官方卸载程序，再删除并验证剩余内容。
+主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再删除并
+验证剩余内容。
 运行前请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。
 
 退出码：
@@ -84,12 +90,13 @@ Usage: ./UTS.sh [options]
 
 Options:
   -y, --yes                Skip the confirmation prompt (required without a terminal)
+      --include-monitor    Also uninstall Cloud Monitor (BaradAgent and Sgagent)
       --dry-run            Show what would be removed, change nothing
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
   -h, --help               Show this help message
 
-Runs the official uninstaller found on the host, then removes and verifies the
-remnants locally.
+Host Security (YunJing) is always uninstalled. Runs the official uninstallers found
+on the host, then removes and verifies the remnants locally.
 Disable Agent uninstall protection in the Host Security console before running.
 
 Exit status:
@@ -154,6 +161,11 @@ run() {
   printf '\n' >&3
 }
 
+record_failure() {
+  warn "$@"
+  FAILURES=1
+}
+
 require_linux() {
   if [[ "$(uname -s)" != Linux ]]; then
     die "Only Linux is supported. No uninstall was attempted." "仅支持 Linux，未执行任何卸载。"
@@ -162,7 +174,7 @@ require_linux() {
 
 prepare_runtime() {
   local tool=""
-  for tool in awk stat timeout flock; do
+  for tool in awk stat find timeout flock; do
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
   timeout -k 1 1 true 2>/dev/null || die "GNU timeout with -k is required. Install coreutils." "需要支持 -k 的 GNU timeout，请安装 coreutils。"
@@ -205,6 +217,7 @@ parse_args() {
   while (($# > 0)); do
     case "$1" in
       -y|--yes) AUTO_YES=1 ;;
+      --include-monitor) INCLUDE_MONITOR=1 ;;
       --dry-run) DRY_RUN=1 ;;
       --timeout)
         [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,3}$ && "$2" -le 3600 ]] \
@@ -223,6 +236,20 @@ parse_args() {
   fi
 }
 
+component_name() {
+  case "$1" in
+    yunjing) msg "Host Security agent (YunJing)" "主机安全 Agent（YunJing）" ;;
+    monitor) msg "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）" ;;
+  esac
+}
+
+component_selected() {
+  case "$1" in
+    yunjing) return 0 ;;
+    monitor) [[ "${INCLUDE_MONITOR}" -eq 1 ]] ;;
+  esac
+}
+
 confirm() {
   local reply=""
   [[ "${AUTO_YES}" -eq 0 && "${DRY_RUN}" -eq 0 ]] || return 0
@@ -238,7 +265,7 @@ confirm() {
 
 run_local_script() {
   local script_path="$1" description="" header="" rc=0
-  msg "official ${script_path}" "官方卸载程序 ${script_path}"
+  msg "official $2${script_path}" "官方卸载程序 $2${script_path}"
   description="${MSG}"
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     preview "would run ${description}" "将运行${description}"
@@ -255,12 +282,26 @@ run_local_script() {
   return "${rc}"
 }
 
+monitor_targets() {
+  local dir=""
+  printf '%s\n' "${STARGATE_DIRS[@]}"
+  for dir in "${MONITOR_DIRS[@]}"; do
+    printf '%s\n' "${dir}/barad"
+  done
+}
+
 selected_dirs() {
   printf '%s\n' "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}"
+  if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
+    monitor_targets
+  fi
 }
 
 selected_leftovers() {
   printf '%s\n' "${YUNJING_FILES[@]}"
+  if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
+    printf '%s\n' "${MONITOR_FILES[@]}"
+  fi
 }
 
 path_present() {
@@ -285,6 +326,14 @@ remove_path() {
   fi
 }
 
+remove_empty_dir() {
+  local path="$1" entries=""
+  [[ -d "${path}" && ! -L "${path}" ]] || return 0
+  entries="$(find "${path}" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -n 1)" || return 0
+  [[ -z "${entries}" ]] || return 0
+  run rmdir -- "${path}" || return $?
+}
+
 remove_paths() {
   local kind="$1" path="" rc=0
   shift
@@ -300,7 +349,7 @@ uninstall_yunjing() {
   for dir in "${YUNJING_DIRS[@]}"; do
     path_present "${dir}/uninst.sh" || continue
     ran=1
-    run_local_script "${dir}/uninst.sh" || official_rc=$?
+    run_local_script "${dir}/uninst.sh" "" || official_rc=$?
     break
   done
   [[ "${ran}" -eq 1 ]] || log "No official uninst.sh found; cleaning local remnants only." "未找到官方 uninst.sh，仅清理本地残留。"
@@ -312,6 +361,30 @@ uninstall_yunjing() {
   remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   remove_paths file "${YUNJING_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   [[ "${rc}" -eq 0 ]] || return 1
+}
+
+uninstall_monitor() {
+  [[ "${INCLUDE_MONITOR}" -eq 1 ]] || return 0
+  section "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"
+  local dir="" path="" rc=0
+  local -a removals=()
+  while IFS= read -r path; do removals+=("${path}"); done < <(monitor_targets)
+  for dir in "${MONITOR_DIRS[@]}"; do
+    path="${dir}/barad/admin/uninstall.sh"
+    path_present "${path}" || continue
+    run_local_script "${path}" "BaradAgent " || return $?
+  done
+  for dir in "${STARGATE_DIRS[@]}"; do
+    path="${dir}/admin/uninstall.sh"
+    path_present "${path}" || continue
+    run_local_script "${path}" "Sgagent " || return $?
+  done
+  remove_paths tree "${removals[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  for dir in "${MONITOR_DIRS[@]}"; do
+    remove_empty_dir "${dir}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  done
+  remove_paths file "${MONITOR_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  return "${rc}"
 }
 
 verify_uninstall() {
@@ -357,7 +430,7 @@ exit_status() {
 }
 
 main() {
-  local verify_rc=0 yunjing_rc=0
+  local verify_rc=0 rc=0 yunjing_rc=0
 
   exec 3>&1
   parse_args "$@"
@@ -370,10 +443,24 @@ main() {
 
   uninstall_yunjing || yunjing_rc=$?
   if [[ "${yunjing_rc}" -ne 0 ]]; then
-    warn "Host Security agent (YunJing) uninstall is incomplete (${yunjing_rc})." "主机安全 Agent（YunJing）卸载未完成（${yunjing_rc}）。"
+    component_name yunjing
+    warn "${MSG} uninstall is incomplete (${yunjing_rc}); optional components were not processed." \
+      "${MSG}卸载未完成（${yunjing_rc}），未处理可选组件。"
     FAILURES=1
     finish 1
     exit_status "${yunjing_rc}"
+  fi
+
+  if component_selected monitor; then
+    uninstall_monitor || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      component_name monitor
+      record_failure "${MSG} uninstall is incomplete (${rc})." "${MSG}卸载未完成（${rc}）。"
+      if stop_on "${rc}"; then
+        finish 1
+        return "${rc}"
+      fi
+    fi
   fi
 
   if [[ "${DRY_RUN}" -eq 0 ]]; then

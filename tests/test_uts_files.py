@@ -1,3 +1,4 @@
+import shlex
 
 from test_uts import UtsFixture
 
@@ -38,6 +39,7 @@ class FileSafetyTests(UtsFixture):
     def test_file_only_paths_never_remove_directories_recursively(self):
         for relative, command in (
             ("var/run/tat_agent.pid", 'remove_path "$UTS_TEST_ROOT/var/run/tat_agent.pid"'),
+            ("tmp/stargate.lock", "uninstall_monitor"),
         ):
             with self.subTest(path=relative):
                 leftover = self.root / relative
@@ -47,6 +49,7 @@ class FileSafetyTests(UtsFixture):
                 result = self.run_shell(
                     RUN_REAL
                     + r'''
+                    INCLUDE_MONITOR=1
                     '''
                     + command
                     + "\n"
@@ -63,3 +66,22 @@ class FileSafetyTests(UtsFixture):
         )
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(self.events.read_text().splitlines(), ["remove a tree", "remove b tree", "remove c tree"])
+
+    def test_remove_empty_dir_only_removes_a_real_empty_directory(self):
+        monitor = self.root / "usr/local/qcloud/monitor"
+        monitor.mkdir()
+        link = self.root / "usr/local/qcloud/link"
+        link.symlink_to(monitor)
+        missing = self.root / "usr/local/qcloud/missing"
+        busy = self.root / "usr/local/qcloud/busy"
+        (busy / "data").mkdir(parents=True)
+        result = self.run_shell(
+            RUN_REAL
+            + "\n".join(f"remove_empty_dir {shlex.quote(str(path))}" for path in (link, missing, busy, monitor))
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text(), f"run rmdir -- {monitor}\n")
+        self.assertTrue(link.is_symlink())
+        self.assertTrue((busy / "data").is_dir())
+        self.assertFalse(monitor.exists())
+
