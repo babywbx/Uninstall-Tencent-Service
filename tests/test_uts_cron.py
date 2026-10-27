@@ -5,7 +5,14 @@ import stat
 from test_uts import UtsFixture
 
 
-SGAGENT_LINE = "*/5 * * * * /usr/local/qcloud/stargate/admin/start.sh > /dev/null 2>&1 &"
+SGAGENT_LINE = (
+    "*/5 * * * * flock -xn /tmp/stargate.lock -c "
+    "'/usr/local/qcloud/stargate/admin/start.sh > /dev/null 2>&1 &'"
+)
+SGAGENTTASK_LINE = (
+    "* * * * * root flock -xn /tmp/stargate.lock -c "
+    "'/usr/local/qcloud/stargate/admin/start.sh > /dev/null 2>&1 &'"
+)
 YUNJING_LINE = "0 0 * * * /usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1 &"
 BARAD_LINE = "*/5 * * * * /usr/local/qcloud/monitor/barad/admin/trystart.sh"
 OTHER_COMPONENT_LINE = "*/5 * * * * /usr/local/qcloud/monitor/other/agent.sh"
@@ -23,10 +30,28 @@ COMPOUND_COMMANDS = (
     "/opt/backup.sh && /usr/local/qcloud/YunJing/YDCrontab.sh",
     "/usr/local/qcloud/YunJing/YDCrontab.sh & /opt/backup.sh",
     "/usr/local/qcloud/YunJing/YDCrontab.sh 2>&1 & /opt/backup.sh &",
+    "sh -c '/usr/local/qcloud/YunJing/YDCrontab.sh'",
+    "flock /tmp/other.lock /usr/local/qcloud/YunJing/YDCrontab.sh",
+    "flock -xn /tmp/stargate.lock -c '/usr/local/qcloud/YunJing/YDCrontab.sh' && /opt/backup.sh",
+    "flock -xn /tmp/stargate.lock -c '/usr/local/qcloud/YunJing/YDCrontab.sh' > /tmp/agent.log",
+    "/usr/bin/env -S 'bash /usr/local/qcloud/YunJing/YDCrontab.sh'",
+)
+WRAPPED_AGENT_COMMANDS = (
+    "/usr/bin/env bash /usr/local/qcloud/YunJing/YDCrontab.sh",
+    "env -- /bin/bash '/usr/local/qcloud/YunJing/YDCrontab.sh'",
+    "flock -xn /tmp/stargate.lock -c '/usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1 &' # keep running",
+    'flock -xn /tmp/stargate.lock -c "env bash /usr/local/qcloud/YunJing/YDCrontab.sh" # keep running',
+    "env flock -xn /tmp/stargate.lock -c '/usr/local/qcloud/YunJing/YDCrontab.sh'",
+)
+WRAPPED_REFERENCES = (
+    "/usr/bin/env /bin/echo '/usr/local/qcloud/YunJing/YDCrontab.sh'",
+    "env echo /usr/local/qcloud/YunJing/YDCrontab.sh",
+    "flock -xn /tmp/backup.lock -c '/opt/backup' # /usr/local/qcloud/YunJing/YDCrontab.sh",
+    "flock -xn /tmp/backup.lock -c '/bin/echo /usr/local/qcloud/YunJing/YDCrontab.sh' # keep reference",
 )
 YUNJING_JOBS = (
     "*/30 * * * * root /usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1\n"
-    "@reboot root /usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1\n"
+    "@reboot root sleep 30 && /usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1\n"
 )
 KEEP_JOBS = (
     "SHELL=/bin/bash\n"
@@ -180,14 +205,28 @@ class RootCrontabTests(UtsFixture):
             f"{path}&",
             f"'{path}'",
             f'"{path}" > /dev/null 2>&1 &',
+            f"bash {path}",
+            f"/bin/bash -- '{path}'",
+            f"flock -xn /tmp/stargate.lock -c '{path} > /dev/null 2>&1 &'",
+            f"/usr/bin/flock -xn /tmp/stargate.lock -c '/bin/bash {path}'",
         )
         lines = [f"*/30 * * * * {command}" for command in commands]
-        lines.append(f"@reboot {path} > /dev/null 2>&1")
+        lines.append(f"@reboot sleep 30 && {path} > /dev/null 2>&1")
         self.listing.write_text("\n".join(lines) + "\n")
         result = self.run_shell(self.crontab_mocks() + "remove_cron_lines /qcloud/YunJing/")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.events.read_text(), "run crontab -u root -r\n")
         self.assertEqual(result.stdout.count("Removing root crontab line:"), len(lines))
+
+    def test_wrapped_agent_jobs_are_removed_without_deleting_references(self):
+        kept = "".join(f"* * * * * {command}\n" for command in WRAPPED_REFERENCES)
+        jobs = "".join(f"* * * * * {command}\n" for command in WRAPPED_AGENT_COMMANDS)
+        self.listing.write_text(jobs + kept)
+        result = self.run_shell(self.crontab_mocks() + "remove_cron_lines /qcloud/YunJing/")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.written.exists(), result.stdout + result.stderr)
+        self.assertEqual(self.written.read_text(), kept)
+        self.assertEqual(result.stdout.count("Removing root crontab line:"), len(WRAPPED_AGENT_COMMANDS))
 
     def test_compound_agent_cron_is_preserved_and_reported(self):
         for command in COMPOUND_COMMANDS:
@@ -243,6 +282,15 @@ class SystemCronTests(UtsFixture):
         self.assertEqual(stat.S_IMODE(self.cron.stat().st_mode), 0o640)
         self.assertEqual(self.cron.stat().st_uid, owner)
         self.assertFalse(list(self.cron.parent.glob(".uts-cron.*")))
+
+    def test_wrapped_system_jobs_are_removed_without_deleting_references(self):
+        kept = "".join(f"* * * * * root {command}\n" for command in WRAPPED_REFERENCES)
+        jobs = "".join(f"* * * * * root {command}\n" for command in WRAPPED_AGENT_COMMANDS)
+        self.cron.write_text(jobs + kept)
+        result = self.clean()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.cron.read_text(), kept)
+        self.assertEqual(result.stdout.count("Removing "), len(WRAPPED_AGENT_COMMANDS))
 
     def test_dry_run_preserves_contents_and_permissions(self):
         self.cron.write_text(YUNJING_JOBS + KEEP_JOBS)

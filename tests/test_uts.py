@@ -324,7 +324,7 @@ class MainTests(UtsFixture):
             stat() { printf '0\n'; }
             root_crontab() {
               QUERY_OUTPUT="$(
-              printf '%s\n' "*/5 * * * * ${STARGATE_DIRS[0]}/admin/start.sh > /dev/null 2>&1 &"
+              printf '%s\n' "*/5 * * * * flock -xn /tmp/stargate.lock -c '${STARGATE_DIRS[0]}/admin/start.sh > /dev/null 2>&1 &'"
               printf '%s\n' "0 3 * * * /usr/local/bin/backup.sh"
               )"
             }
@@ -338,7 +338,7 @@ class MainTests(UtsFixture):
             f"[DRY-RUN] would run official {yunjing}/uninst.sh",
             f"[DRY-RUN] would run official BaradAgent {barad}/admin/uninstall.sh",
             f"[DRY-RUN] would run official Sgagent {stargate}/admin/uninstall.sh",
-            f"[DRY-RUN] remove root crontab line: */5 * * * * {stargate}/admin/start.sh",
+            "[DRY-RUN] remove root crontab line: */5 * * * * flock",
             f"[DRY-RUN] rm -rf -- {yunjing}",
             f"[DRY-RUN] rm -rf -- {stargate}",
             f"[DRY-RUN] rm -rf -- {barad}",

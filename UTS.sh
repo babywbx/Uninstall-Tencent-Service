@@ -566,7 +566,13 @@ root_crontab() {
 
 cron_agent_line() {
   local line="$1" system_file="$2" minute="" hour="" day="" month="" weekday="" command="" user="" pattern="" prefix="" directory="" executable="" inspection="" redirect='2>&1'
+  local quote="" trailing=""
   local macro_re='^[[:space:]]*@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)[[:space:]]+(.+)$'
+  local sleep_re='^(sleep|/(usr/)?bin/sleep)[[:space:]]+[0-9]+[[:space:]]*&&[[:space:]]*(.+)$'
+  local env_re='^(env|/(usr/)?bin/env)[[:space:]]+(.+)$'
+  local flock_re='^(flock|/(usr/)?bin/flock)[[:space:]]+-xn[[:space:]]+[^[:space:]]+[[:space:]]+-c[[:space:]]+(.+)$'
+  local comment_re='^[[:space:]]+(#.*)?$'
+  local shell_re='^((/(usr/)?bin/)?(sh|bash|dash))[[:space:]]+(--[[:space:]]+)?(.+)$'
   local executable_re="^['\"]?([^[:space:]'\";&|]+)['\"]?([[:space:]].*)?$"
   local -a directories=("${YUNJING_DIRS[@]}" "${STARGATE_DIRS[@]}")
   shift 2
@@ -583,6 +589,45 @@ cron_agent_line() {
     [[ -n "${user}" ]] || return 1
   fi
   command="${command#"${command%%[![:space:]]*}"}"
+  while :; do
+    if [[ "${command}" =~ ${sleep_re} ]]; then
+      command="${BASH_REMATCH[3]}"
+    elif [[ "${command}" =~ ${env_re} ]]; then
+      command="${BASH_REMATCH[3]}"
+      if [[ "${command}" == --[[:space:]]* ]]; then
+        command="${command#--}"
+        command="${command#"${command%%[![:space:]]*}"}"
+      fi
+      if [[ "${command}" == -* || "${command}" =~ ^[[:alpha:]_][[:alnum:]_]*= ]]; then
+        for pattern in "$@"; do [[ "${command}" != *"${pattern}"* ]] || return 2; done
+        return 1
+      fi
+    elif [[ "${command}" =~ ${flock_re} ]]; then
+      command="${BASH_REMATCH[3]}"
+      if [[ "${command:0:1}" == \" || "${command:0:1}" == \' ]]; then
+        quote="${command:0:1}"
+        command="${command:1}"
+        trailing="${command#*"${quote}"}"
+        if [[ "${command}" != *"${quote}"* || -n "${trailing}" && ! "${trailing}" =~ ${comment_re} ]]; then
+          for pattern in "$@"; do [[ "${command}" != *"${pattern}"* ]] || return 2; done
+          return 1
+        fi
+        command="${command%%"${quote}"*}"
+      fi
+    elif [[ "${command}" =~ ^(flock|/(usr/)?bin/flock)[[:space:]] ]]; then
+      for pattern in "$@"; do [[ "${command}" != *"${pattern}"* ]] || return 2; done
+      return 1
+    else
+      break
+    fi
+  done
+  if [[ "${command}" =~ ${shell_re} ]]; then
+    command="${BASH_REMATCH[6]}"
+    if [[ "${command}" == -* ]]; then
+      for pattern in "$@"; do [[ "${command}" != *"${pattern}"* ]] || return 2; done
+      return 1
+    fi
+  fi
   inspection="${command//"${redirect}"/}"
   inspection="${inspection%"${inspection##*[![:space:]]}"}"
   inspection="${inspection%&}"

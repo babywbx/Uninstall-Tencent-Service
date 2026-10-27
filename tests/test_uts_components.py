@@ -328,7 +328,7 @@ class MonitorTests(UtsFixture):
             WORKDIR="$UTS_TEST_ROOT/tmp"
             root_crontab() {
               QUERY_OUTPUT="$(
-              printf '%s\n' "*/5 * * * * ${STARGATE_DIRS[0]}/admin/start.sh > /dev/null 2>&1 &"
+              printf '%s\n' "*/5 * * * * flock -xn /tmp/stargate.lock -c '${STARGATE_DIRS[0]}/admin/start.sh > /dev/null 2>&1 &'"
               printf '%s\n' "*/5 * * * * ${MONITOR_DIRS[0]}/barad/admin/trystart.sh"
               printf '%s\n' "0 3 * * * /usr/local/bin/backup.sh"
               printf '%s\n' "*/5 * * * * /usr/local/qcloud/monitor/other/agent.sh"
