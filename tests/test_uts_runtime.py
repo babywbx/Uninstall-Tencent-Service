@@ -347,3 +347,18 @@ class LinuxProcessTests(UtsFixture):
         binary.unlink()
         self.assertTrue(os.readlink(f"/proc/{agent.pid}/exe").endswith(" (deleted)"))
         self.stop_agents(agent, bystander)
+
+    def test_relative_agent_script_preserves_external_symlink_script(self):
+        body = "trap 'exit 0' TERM\nwhile :; do read -r -t 1 line || :; done\n"
+        script = self.installation / "startYD.sh"
+        script.write_text(body)
+        outside = self.base / "other/start.sh"
+        outside.parent.mkdir()
+        outside.write_text(body)
+        link = self.installation / "start.sh"
+        link.symlink_to(outside)
+        agent = self.spawn([BASH, "./startYD.sh"], cwd=self.installation)
+        bystander = self.spawn([BASH, str(link)])
+        self.stop_agents(agent, bystander)
+        self.assertEqual(outside.read_text(), body)
+        self.assertTrue(link.is_symlink())

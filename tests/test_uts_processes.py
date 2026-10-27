@@ -37,6 +37,30 @@ class ProcessTests(UtsFixture):
         self.assertIn(f"900011|{real}|", result.stdout)
         self.assertNotIn("(deleted)", result.stdout)
 
+    def test_shell_wrappers_match_only_scripts_inside_selected_dirs(self):
+        inside = (
+            ("/bin/sh", ["sh", f"{self.stargate}/admin/start.sh"]),
+            ("/bin/bash", ["bash", f"{self.monitor}/barad/admin/trystart.sh"]),
+            ("/bin/sh", ["sh", "-e", f"{self.yunjing}/startYD.sh"]),
+            ("/bin/dash", ["dash", "-eu", "--", f"{self.yunjing}/stopYDCore.sh"]),
+        )
+        outside = (
+            ("/bin/sh", ["sh", f"{self.root}/opt/other/admin/start.sh"]),
+            ("/bin/bash", ["bash", f"{self.root}/usr/local/qcloud/other/admin/trystart.sh"]),
+            ("/bin/sh", ["sh", "-e", f"{self.root}/home/admin/startYD.sh"]),
+            ("/bin/bash", ["bash", f"{self.yunjing}/uninst.sh"]),
+        )
+        for index, (shell, arguments) in enumerate(inside):
+            self.process(900020 + index, shell, arguments)
+        for index, (shell, arguments) in enumerate(outside):
+            self.process(900030 + index, shell, arguments)
+        result = self.run_shell(self.selected_scan())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for index in range(len(inside)):
+            self.assertIn(f"{900020 + index}|", result.stdout)
+        for index in range(len(outside)):
+            self.assertNotIn(f"{900030 + index}|", result.stdout)
+
     def test_arguments_that_only_mention_agent_paths_are_not_matched(self):
         start = f"{self.stargate}/admin/start.sh"
         startyd = f"{self.yunjing}/startYD.sh"
@@ -54,6 +78,84 @@ class ProcessTests(UtsFixture):
         result = self.run_shell(self.selected_scan())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
+
+    def test_relative_shell_scripts_are_resolved_from_process_cwd(self):
+        script = self.yunjing / "startYD.sh"
+        script.write_text("exit 0\n")
+        for pid, argument in ((900044, "./startYD.sh"), (900045, "startYD.sh")):
+            proc = self.process(pid, "/bin/bash", ["bash", argument])
+            (proc / "cwd").symlink_to(self.yunjing)
+        result = self.run_shell('agent_processes "${YUNJING_DIRS[@]}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("900044|", result.stdout)
+        self.assertIn("900045|", result.stdout)
+
+    def test_shell_scripts_escaping_agent_directory_are_not_matched(self):
+        other = self.yunjing.parent / "other"
+        other.mkdir()
+        (other / "start.sh").write_text("exit 0\n")
+        outside = self.root / "opt/start.sh"
+        outside.write_text("exit 0\n")
+        link = self.yunjing / "start.sh"
+        link.symlink_to(outside)
+        admin = self.yunjing / "admin"
+        admin.mkdir()
+        self.process(900046, "/bin/bash", ["bash", f"{self.yunjing}/../other/start.sh"])
+        self.process(900047, "/bin/bash", ["bash", str(link)])
+        self.process(900057, "/bin/bash", ["bash", f"{admin}/../start.sh"])
+        for removed in (False, True):
+            with self.subTest(intermediate_directory_removed=removed):
+                if removed:
+                    admin.rmdir()
+                result = self.run_shell('agent_processes "${YUNJING_DIRS[@]}"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_shell_wrappers_remain_detectable_after_installation_is_deleted(self):
+        admin = self.yunjing / "admin"
+        admin.mkdir()
+        (admin / "start.sh").write_text("exit 0\n")
+        self.process(900048, "/bin/bash", ["bash", f"{admin}/./start.sh"])
+        relative = self.process(900049, "/bin/bash", ["bash", "./start.sh"])
+        (relative / "cwd").symlink_to(f"{os.path.realpath(admin)} (deleted)")
+        shutil.rmtree(self.yunjing)
+        result = self.run_shell('agent_processes "${YUNJING_DIRS[@]}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("900048|", result.stdout)
+        self.assertIn("900049|", result.stdout)
+
+    def test_unresolved_agent_script_symlink_fails_scan_without_signalling(self):
+        release = self.yunjing / "releases/v1/admin"
+        release.mkdir(parents=True)
+        (release / "start.sh").write_text("exit 0\n")
+        (self.yunjing / "admin").symlink_to("releases/v1/admin")
+        script = str(self.yunjing / "admin/start.sh")
+        self.process(900058, "/bin/bash", ["bash", script])
+        result = self.run_shell('agent_processes "${YUNJING_DIRS[@]}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("900058|", result.stdout)
+        shutil.rmtree(self.yunjing / "releases")
+        for function in ("agent_processes", "stop_agent_processes"):
+            with self.subTest(function=function):
+                result = self.run_shell(f'{function} "${{YUNJING_DIRS[@]}}"')
+                self.assert_failed(result)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.events.read_text(), "")
+
+    def test_busybox_matching_requires_shell_applet(self):
+        start = f"{self.stargate}/admin/start.sh"
+        self.process(900050, "/bin/busybox", ["sh", "-e", start])
+        self.process(900051, "/bin/busybox", ["ash", start])
+        self.process(900052, "/bin/busybox", ["tail", "-f", start])
+        for pid, applet in ((900053, "sh"), (900054, "ash"), (900055, "hush")):
+            self.process(pid, "/bin/busybox", ["busybox", applet, "-e", start])
+        self.process(900056, "/bin/busybox", ["busybox", "tail", "-f", start])
+        result = self.run_shell('agent_processes "${STARGATE_DIRS[@]}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for pid in (900050, 900051, 900053, 900054, 900055):
+            self.assertIn(f"{pid}|", result.stdout)
+        self.assertNotIn("900052|", result.stdout)
+        self.assertNotIn("900056|", result.stdout)
 
     def test_unreadable_process_fails_scan_and_stop(self):
         service = str(self.yunjing / "YDService")
@@ -104,6 +206,58 @@ class ProcessTests(UtsFixture):
                 expected = [f"kill -TERM {pid}"] if changed is None else []
                 self.assertEqual(self.events.read_text().splitlines(), expected)
                 self.assertNotIn("Cannot signal", result.stderr)
+
+    def test_process_reused_during_scan_is_not_signalled(self):
+        original = self.real_function("is_agent_process").replace(
+            "is_agent_process() {", "original_is_agent_process() {", 1
+        )
+        for changed, started in (("arguments", 100), ("pid", 101)):
+            with self.subTest(changed=changed):
+                proc = self.process(900074, "/bin/bash", ["bash", str(self.yunjing / "startYD.sh")])
+                fields = " ".join(["S", *(["0"] * 18), str(started)])
+                try:
+                    result = self.run_shell(
+                        original
+                        + r'''
+                        is_agent_process() {
+                          original_is_agent_process "$@" || return $?
+                          printf 'bash\0/home/admin/unrelated.sh\0' > "$1/cmdline"
+                        '''
+                        + f'  printf "%s\\n" "900074 (unrelated) {fields}" > "$1/stat"\n'
+                        + r'''
+                        }
+                        kill() { record "kill $*"; }
+                        targets="$(agent_processes "${YUNJING_DIRS[@]}")"
+                        printf '%s' "$targets"
+                        signal_agent_processes TERM "$targets"
+                        '''
+                    )
+                finally:
+                    shutil.rmtree(proc)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.events.read_text(), "")
+                self.assertEqual(result.stdout, "")
+
+    def test_candidate_recheck_failure_aborts_scan_without_signalling(self):
+        proc = self.process(900075, "/bin/bash", ["bash", "startYD.sh"])
+        (proc / "cwd").symlink_to(self.yunjing)
+        original = self.real_function("process_token").replace(
+            "process_token() {", "original_process_token() {", 1
+        )
+        result = self.run_shell(
+            original
+            + r'''
+            process_token() {
+              command rm -- "$1/cwd"
+              original_process_token "$@"
+            }
+            kill() { record "kill $*"; }
+            stop_agent_processes "${YUNJING_DIRS[@]}"
+            '''
+        )
+        self.assert_failed(result)
+        self.assertIn("Cannot inspect working directory for PID 900075", result.stderr)
+        self.assertEqual(self.events.read_text(), "")
 
     def test_with_real_paths_adds_resolved_directory_and_matches_processes(self):
         real_root = os.path.realpath(self.root)

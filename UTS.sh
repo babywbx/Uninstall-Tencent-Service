@@ -390,9 +390,49 @@ process_token() {
 }
 
 is_agent_process() {
-  local executable="$2"
+  local entry="$1" executable="$2" script="" argv0="" cwd="" resolved=""
   shift 2
-  path_in_dirs "${executable}" "$@"
+  path_in_dirs "${executable}" "$@" && return 0
+  case "${executable##*/}" in
+    sh|bash|dash|busybox)
+      {
+        IFS= read -r -d '' argv0 || return 1
+        if [[ "${executable##*/}" == busybox ]]; then
+          if [[ "${argv0##*/}" == busybox ]]; then
+            IFS= read -r -d '' argv0 || return 1
+          fi
+          case "${argv0##*/}" in sh|ash|hush) ;; *) return 1 ;; esac
+        fi
+        while IFS= read -r -d '' script || [[ -n "${script}" ]]; do
+          case "${script}" in
+            --) IFS= read -r -d '' script || true; break ;;
+            -?*|+?*) [[ "${script}" =~ ^[+-][abefhiklmnprtuvxBCEHPT]+$ ]] || return 1 ;;
+            *) break ;;
+          esac
+        done
+      } <"${entry}/cmdline" 2>/dev/null
+      case "${script##*/}" in
+        start.sh|stop.sh|restart.sh|trystart.sh|startYD.sh|stopYDCore.sh|YDCrontab.sh|self_update.sh|install.sh|init_install.sh)
+          if [[ "${script}" != /* ]]; then
+            cwd="$(readlink -- "${entry}/cwd" 2>/dev/null)" || {
+              warn "Cannot inspect working directory for PID ${entry##*/}." "无法检查 PID ${entry##*/} 的工作目录。"
+              return 2
+            }
+            script="${cwd% (deleted)}/${script}"
+          fi
+          resolved="$(resolved_path "${script}")" || {
+            if path_in_dirs "${script}" "$@"; then
+              warn "Cannot resolve agent script for PID ${entry##*/}: ${script}." "无法解析 PID ${entry##*/} 的 Agent 脚本：${script}。"
+              return 2
+            fi
+            return 1
+          }
+          path_in_dirs "${resolved}" "$@" && return 0
+          ;;
+      esac
+      ;;
+  esac
+  return 1
 }
 
 agent_processes() {
@@ -434,6 +474,11 @@ agent_processes() {
       [[ ! -d "${entry}" ]] || rc=1
       continue
     }
+    is_agent_process "${entry}" "${executable}" "${dirs[@]}" || match_rc=$?
+    if [[ "${match_rc}" -ne 0 ]]; then
+      [[ "${match_rc}" -eq 1 ]] || rc=1
+      continue
+    fi
     printf '%s|%s|%s\n' "${pid}" "${executable}" "${token}"
   done
   return "${rc}"
