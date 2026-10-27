@@ -197,6 +197,11 @@ class RootCrontabTests(UtsFixture):
         result = self.run_shell(self.crontab_mocks() + "remove_cron_lines /qcloud/YunJing/")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.written.read_text(), "\n".join(references) + "\n")
+        spool = self.root / "var/spool/cron/root"
+        spool.parent.mkdir(parents=True)
+        spool.write_text("\n".join(references) + "\n")
+        verified = self.run_shell("cron_remnants /qcloud/YunJing/")
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
 
     def test_known_agent_command_forms_are_removed(self):
         path = "/usr/local/qcloud/YunJing/YDCrontab.sh"
@@ -229,6 +234,8 @@ class RootCrontabTests(UtsFixture):
         self.assertEqual(result.stdout.count("Removing root crontab line:"), len(WRAPPED_AGENT_COMMANDS))
 
     def test_compound_agent_cron_is_preserved_and_reported(self):
+        spool = self.root / "var/spool/cron/root"
+        spool.parent.mkdir(parents=True)
         for command in COMPOUND_COMMANDS:
             with self.subTest(command=command):
                 line = f"0 * * * * {command}\n"
@@ -239,6 +246,10 @@ class RootCrontabTests(UtsFixture):
                 self.assertEqual(self.events.read_text(), "")
                 self.assertEqual(self.listing.read_text(), line)
                 self.assertFalse(self.written.exists())
+                spool.write_text(line)
+                verified = self.run_shell("cron_remnants /qcloud/YunJing/")
+                self.assert_failed(verified)
+                self.assertIn(str(spool), verified.stderr)
 
 
 class SystemCronTests(UtsFixture):
@@ -349,3 +360,73 @@ class SystemCronTests(UtsFixture):
                 self.assertEqual(stat.S_IMODE(self.cron.stat().st_mode), 0o640)
                 self.assertEqual(self.events.read_text(), "")
                 self.assertFalse(list(self.cron.parent.glob(".uts-cron.*")))
+                verified = self.run_shell("cron_remnants /qcloud/YunJing/")
+                self.assert_failed(verified)
+                self.assertIn(str(self.cron), verified.stderr)
+
+
+class CronRemnantTests(UtsFixture):
+    def system_cron_files(self):
+        cron_d = self.root / "etc/cron.d"
+        cron_d.mkdir()
+        (cron_d / "logrotate").write_text("0 2 * * * root /usr/sbin/logrotate /etc/logrotate.conf\n")
+        (self.root / "etc/crontab").write_text(
+            "SHELL=/bin/sh\n17 * * * * root run-parts /etc/cron.hourly\n"
+            "*/5 * * * * root /usr/local/qcloud/monitor/other/agent.sh\n"
+        )
+        spool = self.root / "var/spool/cron"
+        (spool / "crontabs").mkdir(parents=True)
+        (spool / "root").write_text(f"30 6 * * * /usr/local/bin/backup.sh\n{OTHER_COMPONENT_LINE}\n")
+        (spool / "crontabs/root").write_text("30 6 * * * /usr/local/bin/backup.sh\n")
+        return cron_d, spool
+
+    def selected(self, command):
+        return (
+            "INCLUDE_MONITOR=1\npatterns=()\n"
+            'while IFS= read -r pattern; do patterns+=("$pattern"); done < <(selected_cron_patterns)\n'
+            f'{command} "${{patterns[@]}}"\n'
+        )
+
+    def test_cron_remnants_reports_matching_system_cron_files(self):
+        cron_d, spool = self.system_cron_files()
+        (cron_d / "sgagenttask").write_text(SGAGENTTASK_LINE + "\n")
+        (spool / "crontabs/root").write_text(f"30 6 * * * /usr/local/bin/backup.sh\n{YUNJING_LINE}\n")
+        result = self.run_shell(self.selected("cron_remnants"))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"Cron entry remains in {cron_d}/sgagenttask:\n{SGAGENTTASK_LINE}\n", result.stderr)
+        self.assertIn(f"Cron entry remains in {spool}/crontabs/root:\n{YUNJING_LINE}\n", result.stderr)
+        self.assertEqual(result.stderr.count("Cron entry remains"), 2)
+        self.assertNotIn("backup.sh", result.stderr)
+        self.assertNotIn("logrotate", result.stderr)
+        self.assertNotIn("monitor/other", result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+
+    def test_cron_remnants_passes_when_only_other_jobs_match(self):
+        self.system_cron_files()
+        result = self.run_shell(self.selected("cron_remnants"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.events.read_text(), "")
+
+    def test_wrapped_jobs_are_detected_in_root_and_system_cron(self):
+        cron_d, spool = self.system_cron_files()
+        for path, user in ((cron_d / "yunjing", "root "), (spool / "root", "")):
+            with self.subTest(path=path):
+                for command in WRAPPED_AGENT_COMMANDS:
+                    with self.subTest(command=command):
+                        path.write_text(f"* * * * * {user}{command}\n")
+                        result = self.run_shell("cron_remnants /qcloud/YunJing/")
+                        self.assert_failed(result)
+                        self.assertIn(str(path), result.stderr)
+                path.write_text("".join(f"* * * * * {user}{command}\n" for command in WRAPPED_REFERENCES))
+                result = self.run_shell("cron_remnants /qcloud/YunJing/")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+
+    def test_cron_verification_rejects_read_errors(self):
+        cron = self.root / "etc/crontab"
+        cron.write_text("*/5 * * * * root /usr/local/qcloud/YunJing/YDCrontab.sh\n")
+        result = self.run_shell("grep() { return 2; }\ncron_remnants /qcloud/YunJing/")
+        self.assert_failed(result)
+        self.assertIn(f"Cannot inspect cron file: {cron}.", result.stderr)
+        self.assertEqual(self.events.read_text(), "")

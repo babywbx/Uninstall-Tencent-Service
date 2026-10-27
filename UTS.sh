@@ -319,6 +319,13 @@ selected_dirs() {
   fi
 }
 
+selected_cron_patterns() {
+  printf '%s\n' /qcloud/YunJing/
+  if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
+    printf '%s\n' /qcloud/stargate/ /qcloud/monitor/barad/
+  fi
+}
+
 selected_leftovers() {
   printf '%s\n' "${YUNJING_FILES[@]}"
   if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
@@ -737,6 +744,43 @@ remove_system_cron_lines() {
   return "${rc}"
 }
 
+cron_remnants() {
+  local file="" pattern="" line="" matches="" confirmed="" found=0 rc=0 system_file=0 match_rc=0
+  local -a cron_files=(/etc/crontab /var/spool/cron/root /var/spool/cron/crontabs/root /etc/cron.d/*)
+  local -a patterns=()
+  for pattern in "$@"; do patterns+=(-e "${pattern}"); done
+  for file in "${cron_files[@]}"; do
+    path_present "${file}" || continue
+    if [[ ! -f "${file}" || ! -r "${file}" ]]; then
+      warn "Cannot inspect cron file: ${file}." "无法检查定时任务文件：${file}。"
+      found=1
+      continue
+    fi
+    rc=0
+    matches="$(grep -F "${patterns[@]}" -- "${file}" 2>/dev/null)" || rc=$?
+    [[ "${rc}" -ne 1 ]] || continue
+    if [[ "${rc}" -ne 0 ]]; then
+      warn "Cannot inspect cron file: ${file}." "无法检查定时任务文件：${file}。"
+      found=1
+      continue
+    fi
+    system_file=0
+    [[ "${file}" != /etc/crontab && "${file}" != /etc/cron.d/* ]] || system_file=1
+    confirmed=""
+    while IFS= read -r line; do
+      match_rc=0
+      cron_agent_line "${line}" "${system_file}" "$@" || match_rc=$?
+      if [[ "${match_rc}" -ne 1 ]]; then confirmed+="${line}"$'\n'; fi
+    done <<<"${matches}"
+    if [[ -n "${confirmed}" ]]; then
+      warn "Cron entry remains in ${file}:" "${file} 中仍有定时任务："
+      printf '%s' "${confirmed}" >&2
+      found=1
+    fi
+  done
+  return "${found}"
+}
+
 remove_paths() {
   local kind="$1" path="" rc=0
   shift
@@ -806,7 +850,7 @@ uninstall_monitor() {
 
 verify_uninstall() {
   local path="" targets="" found=0
-  local -a dirs=()
+  local -a dirs=() patterns=()
   while IFS= read -r path; do
     dirs+=("${path}")
     if path_present "${path}"; then
@@ -814,12 +858,14 @@ verify_uninstall() {
       found=1
     fi
   done < <(selected_dirs)
+  while IFS= read -r path; do patterns+=("${path}"); done < <(selected_cron_patterns)
   targets="$(agent_processes "${dirs[@]}")" || return 1
   if [[ -n "${targets}" ]]; then
     warn "Agent processes remain:" "仍有 Agent 进程："
     show_processes "${targets}"
     found=1
   fi
+  cron_remnants "${patterns[@]}" || found=1
   while IFS= read -r path; do
     [[ -n "${path}" ]] || continue
     if path_present "${path}"; then
@@ -891,7 +937,7 @@ main() {
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     section "Verification" "验证"
     if verify_uninstall; then
-      ok "No agent files or processes remain." "未发现 Agent 文件或进程残留。"
+      ok "No agent files, processes or cron entries remain." "未发现 Agent 文件、进程或定时任务残留。"
     else
       verify_rc=$?
     fi

@@ -492,14 +492,20 @@ class ComponentTests(UtsFixture):
             with self.subTest(monitor=monitor):
                 result = self.run_shell(
                     f"INCLUDE_MONITOR={monitor}\n"
-                    "selected_dirs; echo ---; selected_leftovers"
+                    "selected_dirs; echo ---; "
+                    "selected_cron_patterns; echo ---; selected_leftovers"
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "")
-                dirs, leftovers = (
+                dirs, patterns, leftovers = (
                     part.splitlines() for part in result.stdout.split("---\n")
                 )
                 self.assertEqual(dirs, [str(path) for path in yunjing_dirs + monitor_dirs * monitor])
+                self.assertEqual(
+                    patterns,
+                    ["/qcloud/YunJing/"]
+                    + ["/qcloud/stargate/", "/qcloud/monitor/barad/"] * monitor,
+                )
                 self.assertEqual(
                     leftovers,
                     [str(path) for path in yunjing_leftovers + monitor_leftovers * monitor],

@@ -440,7 +440,7 @@ class MainTests(UtsFixture):
             "==> Host Security agent (YunJing)",
             "==> Cloud Monitor (BaradAgent / Sgagent)",
             "==> Verification",
-            "[ OK ] No agent files or processes remain.",
+            "[ OK ] No agent files, processes or cron entries remain.",
             "[ OK ] Uninstall-Tencent-Service: local uninstall verified.",
         ]
         for reply, proceeds in (("y", True), ("yes", True), ("YES", True), ("n", False), ("", False), ("yess", False)):
@@ -663,6 +663,17 @@ class VerifyTests(UtsFixture):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("Cannot inspect command line for PID 900002.", result.stderr)
 
+    def test_cron_entry_in_unrelated_file_fails_verification(self):
+        cron = self.root / "etc/cron.d/other"
+        cron.parent.mkdir()
+        line = "* * * * * root flock -xn /tmp/stargate.lock -c '/usr/local/qcloud/stargate/admin/start.sh > /dev/null 2>&1 &'"
+        cron.write_text(f"0 3 * * * root /usr/local/bin/backup.sh\n{line}\n")
+        result = self.run_shell(self.verify())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"Cron entry remains in {cron}:", result.stderr)
+        self.assertIn(line, result.stderr)
+        self.assertNotIn("backup.sh", result.stderr)
+
     def test_leftover_symlink_fails_verification(self):
         link = self.root / "tmp/yunjing_install"
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -680,3 +691,17 @@ class VerifyTests(UtsFixture):
         self.assertEqual(
             [line for line in self.events.read_text().splitlines() if line.startswith("run ")], []
         )
+
+    def test_main_reports_incomplete_for_remnant_outside_cleanup_scope(self):
+        cron = self.root / "etc/cron.d/other"
+        cron.parent.mkdir()
+        cron.write_text("* * * * * root /usr/local/qcloud/stargate/admin/start.sh\n")
+        result = self.run_shell(self.main())
+        self.assert_failed(result)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"Cron entry remains in {cron}:", result.stderr)
+        self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
