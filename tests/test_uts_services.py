@@ -1,0 +1,132 @@
+import os
+import shlex
+import subprocess
+
+from test_uts import UtsFixture
+
+
+class ServiceTests(UtsFixture):
+    def setUp(self):
+        super().setUp()
+        self.units = self.root / "etc/systemd/system"
+        self.units.mkdir(parents=True)
+        self.unit = self.units / "tat_agent.service"
+        self.init_script = self.root / "etc/init.d/tat_agent_service"
+
+    def enable_systemd(self):
+        (self.root / "run/systemd/system").mkdir(parents=True, exist_ok=True)
+
+    def write_init_script(self, body="#!/bin/bash\n"):
+        self.init_script.parent.mkdir(exist_ok=True)
+        self.init_script.write_text(body)
+        self.init_script.chmod(0o755)
+
+    def systemd_mocks(self):
+        return r'''
+            command_exists() { [[ "$1" == systemctl ]]; }
+            timeout() {
+              local unit="${@: -1}"
+              if [[ -L "$UTS_TEST_ROOT/etc/systemd/system/$unit" ]]; then
+                printf 'LoadState=masked\n'
+              elif [[ -f "$UTS_TEST_ROOT/etc/systemd/system/$unit" ]]; then
+                printf 'LoadState=loaded\n'
+              else
+                printf 'LoadState=not-found\n'
+              fi
+            }
+        '''
+
+    def test_init_scripts_are_deregistered_without_being_executed(self):
+        self.write_init_script("#!/bin/bash\nprintf ran > /dev/null\nexit 99\n")
+        for tools, deregister in (
+            ("chkconfig", "chkconfig --del tat_agent_service"),
+            ("update-rc.d", "update-rc.d -f tat_agent_service remove"),
+            ("rc-service rc-update", "rc-update del tat_agent_service --all"),
+        ):
+            with self.subTest(tools=tools):
+                result = self.run_shell(
+                    f'command_exists() {{ [[ " {tools} " == *" $1 "* ]]; }}\n'
+                    'stop_services tat_agent tat_agent_service tat_install\n'
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), [f"run {deregister}"])
+
+    def test_sysv_pidfile_stop_hook_cannot_kill_bystander(self):
+        marker = self.root / "tmp/vendor-stop-ran"
+        pidfile = self.root / "var/run/tat_agent.pid"
+        self.write_init_script(
+            "#!/bin/bash\n"
+            + f"PID=$(cat {shlex.quote(str(pidfile))})\n"
+            + 'if ps "$PID" | grep -q tat_agent; then kill -9 "$PID"; fi\n'
+            + f"printf invoked > {shlex.quote(str(marker))}\n"
+        )
+        binaries = self.base / "bin"
+        binaries.mkdir()
+        ps = binaries / "ps"
+        ps.write_text('#!/bin/sh\nprintf "%s tat_agent_bystander\\n" "$1"\n')
+        ps.chmod(0o755)
+        bystander = subprocess.Popen(
+            ["sleep", "30"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            pidfile.write_text(f"{bystander.pid}\n")
+            result = self.run_shell(
+                f"export PATH={shlex.quote(str(binaries))}:\"$PATH\"\n"
+                + r'''
+                command_exists() { [[ "$1" == update-rc.d ]]; }
+                systemd_available() { return 1; }
+                run() {
+                  record "run $*"
+                  if [[ "$1" == "$UTS_TEST_ROOT/etc/init.d/tat_agent_service" ]]; then
+                    command "$@"
+                  fi
+                  return 0
+                }
+                stop_services tat_agent_service
+                '''
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIsNone(bystander.poll(), "Vendor stop hook killed the unrelated process")
+            self.assertFalse(marker.exists())
+            self.assertEqual(self.events.read_text(), "run update-rc.d -f tat_agent_service remove\n")
+            self.assertEqual(pidfile.read_text(), f"{bystander.pid}\n")
+        finally:
+            if bystander.poll() is None:
+                bystander.terminate()
+            bystander.wait(timeout=3)
+
+    def test_loaded_unit_is_stopped_and_disabled_while_missing_units_are_skipped(self):
+        self.enable_systemd()
+        self.unit.write_text("[Service]\n")
+        result = self.run_shell(self.systemd_mocks() + 'stop_services tat_agent tat_agent_service tat_install')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            ["run systemctl stop tat_agent.service", "run systemctl disable tat_agent.service"],
+        )
+        self.assertFalse(self.unit.is_symlink())
+
+    def test_preexisting_mask_is_left_alone(self):
+        self.enable_systemd()
+        self.unit.symlink_to("/dev/null")
+        result = self.run_shell(
+            r'''
+            stat() { printf '0\n'; }
+            command_exists() { [[ "$1" == systemctl ]]; }
+            timeout() {
+              case "$*" in
+                *"LoadState tat_agent.service") printf 'LoadState=masked\n' ;;
+                *LoadState*) printf 'LoadState=not-found\n' ;;
+                *) printf 'ActiveState=inactive\n' ;;
+              esac
+            }
+            stop_services tat_agent
+            '''
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text().splitlines(), ["run systemctl stop tat_agent.service"])
+        self.assertEqual(os.readlink(self.unit), "/dev/null")

@@ -19,6 +19,8 @@ YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup)
 STARGATE_DIRS=(/usr/local/qcloud/stargate /var/lib/qcloud/stargate)
 MONITOR_DIRS=(/usr/local/qcloud/monitor /var/lib/qcloud/monitor)
 MONITOR_FILES=(/tmp/stargate.lock /var/run/stargate.tencentyun.pid /var/run/stargat.tencentyun.pid)
+YUNJING_SERVICES=(YDService YDLive)
+MONITOR_SERVICES=(stargate)
 
 AUTO_YES=0
 INCLUDE_MONITOR=0
@@ -74,7 +76,7 @@ ${SCRIPT_NAME} ${VERSION}
   -h, --help               显示本帮助
 
 主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再停止、
-删除并验证剩余内容。
+删除并验证剩余内容，不会执行 init 停止脚本。
 运行前请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。
 
 退出码：
@@ -100,7 +102,8 @@ Options:
   -h, --help               Show this help message
 
 Host Security (YunJing) is always uninstalled. Runs the official uninstallers found
-on the host, then stops, removes and verifies the remnants locally.
+on the host, then stops, removes and verifies the remnants locally. Init stop
+scripts are never executed.
 Disable Agent uninstall protection in the Host Security console before running.
 
 Exit status:
@@ -361,6 +364,38 @@ remove_empty_dir() {
   entries="$(find "${path}" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -n 1)" || return 0
   [[ -z "${entries}" ]] || return 0
   run rmdir -- "${path}" || return $?
+}
+
+systemd_available() {
+  [[ -d /run/systemd/system ]] && command_exists systemctl
+}
+
+stop_services() {
+  local svc="" suffix="" state="" rc=0
+  for svc in "$@"; do
+    if systemd_available; then
+      for suffix in socket timer service; do
+        query systemctl show -p LoadState "${svc}.${suffix}" || return $?
+        state="${QUERY_OUTPUT}"
+        state="${state#LoadState=}"
+        [[ "${state}" != not-found ]] || continue
+        run systemctl stop "${svc}.${suffix}" || return $?
+        if [[ "${state}" != masked ]]; then
+          run systemctl disable "${svc}.${suffix}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+        fi
+      done
+    fi
+    if [[ -f "/etc/init.d/${svc}" ]]; then
+      if command_exists rc-update; then
+        run rc-update del "${svc}" --all || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+      elif command_exists chkconfig; then
+        run chkconfig --del "${svc}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+      elif command_exists update-rc.d; then
+        run update-rc.d -f "${svc}" remove || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+      fi
+    fi
+  done
+  return "${rc}"
 }
 
 path_in_dirs() {
@@ -812,6 +847,10 @@ uninstall_yunjing() {
   fi
   remove_cron_lines /qcloud/YunJing/ || return $?
   remove_system_cron_lines /etc/cron.d/yunjing /qcloud/YunJing/ || return $?
+  if systemd_available; then
+    run systemctl daemon-reload || return $?
+  fi
+  stop_services "${YUNJING_SERVICES[@]}" || return $?
   if ! stop_agent_processes "${YUNJING_DIRS[@]}"; then
     guard_hint
     return 6
@@ -839,6 +878,10 @@ uninstall_monitor() {
   done
   remove_cron_lines /qcloud/stargate/ /qcloud/monitor/barad/ || return $?
   remove_system_cron_lines /etc/cron.d/sgagenttask /qcloud/stargate/ || return $?
+  if systemd_available; then
+    run systemctl daemon-reload || return $?
+  fi
+  stop_services "${MONITOR_SERVICES[@]}" || return $?
   stop_agent_processes "${removals[@]}" || return 1
   remove_paths tree "${removals[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   for dir in "${MONITOR_DIRS[@]}"; do

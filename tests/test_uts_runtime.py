@@ -144,6 +144,9 @@ class InterruptTests(UtsFixture):
     def test_interrupt_stops_term_ignoring_child_and_preserves_bystander(self):
         self.check_interrupt_cleanup()
 
+    def test_interrupt_stops_service_query_without_waiting_for_deadline(self):
+        self.check_interrupt_cleanup(query=True)
+
     def test_interrupt_stops_root_crontab_query_without_waiting_for_deadline(self):
         self.check_interrupt_cleanup(query="crontab")
 
@@ -171,13 +174,16 @@ class InterruptTests(UtsFixture):
         )
         if query:
             self.vendor_script(
-                binaries / "crontab",
+                binaries / ("crontab" if query == "crontab" else "systemctl"),
                 f"#!{BASH}\n"
                 + 'trap "" TERM\n'
                 + f'printf "%s\\n" "$$" > {shlex.quote(str(child_pid))}\n'
                 + "exec sleep 30\n",
             )
-            body += "remove_cron_lines /qcloud/YunJing/\n"
+            body += (
+                "remove_cron_lines /qcloud/YunJing/\n"
+                if query == "crontab" else "query systemctl show -p LoadState tat_agent.service\n"
+            )
         else:
             body += (
                 f"run {shlex.quote(BASH)} -c {shlex.quote(child_command)} "

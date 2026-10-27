@@ -52,6 +52,7 @@ class FileSafetyTests(UtsFixture):
                     + r'''
                     INCLUDE_MONITOR=1
                     root_crontab() { :; }
+                    stop_services() { :; }
                     stop_agent_processes() { :; }
                     '''
                     + command

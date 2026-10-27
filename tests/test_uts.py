@@ -328,6 +328,7 @@ class MainTests(UtsFixture):
               printf '%s\n' "0 3 * * * /usr/local/bin/backup.sh"
               )"
             }
+            command_exists() { [[ "$1" != systemctl ]]; }
             verify_uninstall() { record verify; }
             main --dry-run --include-monitor
             """
@@ -572,7 +573,7 @@ class MainTests(UtsFixture):
                 self.assertIn(f"uninstall is incomplete ({status})", result.stderr)
                 self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
 
-    def test_cleanup_timeout_is_preserved_through_real_component_and_main(self):
+    def test_service_timeout_is_preserved_through_real_component_and_main(self):
         for component in ("yunjing", "monitor"):
             for status in (124, 137, 143):
                 with self.subTest(component=component, status=status):
@@ -585,14 +586,14 @@ class MainTests(UtsFixture):
                         + "agent_processes() { :; }\n"
                         + "remove_cron_lines() { :; }\n"
                         + "remove_system_cron_lines() { :; }\n"
-                        + "stop_agent_processes() { :; }\n"
-                        + f"remove_paths() {{ record cleanup-timeout; return {status}; }}\n"
+                        + "systemd_available() { return 1; }\n"
+                        + f"stop_services() {{ record service-timeout; return {status}; }}\n"
                         + "verify_uninstall() { record verify; }\n"
                         + "main --yes --include-monitor"
                     )
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                     previous = {"yunjing": [], "monitor": ["yunjing"]}
-                    self.assertEqual(self.events.read_text().splitlines(), previous[component] + ["cleanup-timeout"])
+                    self.assertEqual(self.events.read_text().splitlines(), previous[component] + ["service-timeout"])
                     self.assertNotIn("local uninstall verified", result.stdout)
 
     def test_verified_only_when_no_step_or_verification_failed(self):

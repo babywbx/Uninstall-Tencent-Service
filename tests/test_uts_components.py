@@ -20,6 +20,7 @@ MOCKS = r"""
 """
 LATER_STEPS = r"""
     root_crontab() { :; }
+    stop_services() { record "stop-services $*"; }
     stop_agent_processes() { record stop-processes; }
     remove_path() { record "remove $1"; }
     remove_empty_dir() { record "remove-empty $1"; }
@@ -42,6 +43,7 @@ def install_monitor(root, prefix, scripts=True):
 
 class YunjingTests(UtsFixture):
     local_stubs = r"""
+        stop_services() { record "stop-services $*"; }
         stop_agent_processes() { record "stop-processes $*"; }
         root_crontab() { :; }
         remove_path() { record "remove $1"; }
@@ -60,6 +62,7 @@ class YunjingTests(UtsFixture):
 
     def local_cleanup(self):
         return [
+            "stop-services YDService YDLive",
             f"stop-processes {self.primary} {self.fallback}",
             *self.removals(),
         ]
@@ -196,7 +199,7 @@ class YunjingTests(UtsFixture):
             + "uninstall_yunjing\n"
         )
         self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
-        expected = ["signal TERM"] + ["sleep 1"] * 5
+        expected = ["stop-services YDService YDLive", "signal TERM"] + ["sleep 1"] * 5
         self.assertEqual(self.events.read_text().splitlines(), expected)
         self.assertIn("Agent processes remain; preserving their installation files:", result.stderr)
         self.assertIn("PID 4242", result.stderr)
@@ -256,10 +259,11 @@ class MonitorTests(UtsFixture):
                 )
                 events = self.events.read_text().splitlines()
                 self.assertEqual(
-                    events[:3],
+                    events[:4],
                     [
                         self.official(barad, "timeout -k 5 120"),
                         self.official(sgagent, "timeout -k 5 120"),
+                        "stop-services stargate",
                         "stop-processes",
                     ],
                 )
@@ -334,6 +338,7 @@ class MonitorTests(UtsFixture):
               printf '%s\n' "*/5 * * * * /usr/local/qcloud/monitor/other/agent.sh"
               )"
             }
+            stop_services() { record "services $*"; }
             stop_agent_processes() { record "processes $*"; }
             uninstall_monitor
             """
@@ -349,9 +354,10 @@ class MonitorTests(UtsFixture):
             )
         )
         events = self.events.read_text().splitlines()
-        self.assertEqual(events[:3], [
+        self.assertEqual(events[:4], [
             f"run crontab -u root {self.root}/tmp/crontab",
             f"run rm -f -- {task}",
+            "services stargate",
             f"processes {scanned}",
         ])
         self.assertEqual(
@@ -384,6 +390,28 @@ class MonitorTests(UtsFixture):
                 if mixed:
                     self.assertEqual(task.read_text(), kept)
 
+    def test_monitor_reloads_systemd_before_stopping_services(self):
+        script = self.vendor_script(self.root / "usr/local/qcloud/stargate/admin/uninstall.sh", "#!/bin/bash\nexit 0\n")
+        (self.root / "run/systemd/system").mkdir(parents=True)
+        result = self.run_shell(
+            r"""
+            stat() { printf '0\n'; }
+            root_crontab() { :; }
+            command_exists() { [[ "$1" == systemctl ]]; }
+            stop_services() { record "stop $*"; }
+            stop_agent_processes() { :; }
+            remove_path() { :; }
+            remove_empty_dir() { :; }
+            INCLUDE_MONITOR=1
+            uninstall_monitor
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            [self.official(script), "run systemctl daemon-reload", "stop stargate"],
+        )
+
     def test_monitor_process_sweep_ignores_symlinked_parent_directory(self):
         monitor = self.root / "usr/local/qcloud/monitor"
         monitor.parent.mkdir(parents=True)
@@ -393,6 +421,7 @@ class MonitorTests(UtsFixture):
         result = self.run_shell(
             r"""
             root_crontab() { :; }
+            stop_services() { :; }
             remove_path() { :; }
             remove_empty_dir() { :; }
             stop_agent_processes() { record "sweep $*"; agent_processes "$@" >/dev/null || return 1; }
@@ -417,7 +446,7 @@ class ComponentTests(UtsFixture):
                         result = self.run_shell(
                             "INCLUDE_MONITOR=1\n"
                             + "remove_cron_lines() { :; }\nremove_system_cron_lines() { :; }\n"
-                            + "stop_agent_processes() { :; }\n"
+                            + "stop_services() { :; }\nstop_agent_processes() { :; }\n"
                             + "remove_paths() { record remove; }\n"
                             + f"{failing}() {{ record timed-out; return {status}; }}\n"
                             + f"uninstall_{component}\n"
@@ -433,6 +462,7 @@ class ComponentTests(UtsFixture):
         result = self.run_shell(
             r"""
             remove_cron_lines() { record cron; }
+            stop_services() { record "stop-services $*"; }
             stop_agent_processes() { record "stop-processes $*"; }
             uninstall_monitor
             """
@@ -457,6 +487,7 @@ class ComponentTests(UtsFixture):
                         r"""
                         INCLUDE_MONITOR=1
                         root_crontab() { :; }
+                        stop_services() { record stop; }
                         stop_agent_processes() { record processes; }
                         """
                         + f'{function}() {{ record "failed {function}"; return 1; }}\n'
