@@ -54,6 +54,7 @@ class FileSafetyTests(UtsFixture):
                     root_crontab() { :; }
                     stop_services() { :; }
                     stop_agent_processes() { :; }
+                    cleanup_services() { :; }
                     '''
                     + command
                     + "\n"

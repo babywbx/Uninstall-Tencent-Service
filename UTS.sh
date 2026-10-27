@@ -322,6 +322,13 @@ selected_dirs() {
   fi
 }
 
+selected_services() {
+  printf '%s\n' "${YUNJING_SERVICES[@]}"
+  if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
+    printf '%s\n' "${MONITOR_SERVICES[@]}"
+  fi
+}
+
 selected_cron_patterns() {
   printf '%s\n' /qcloud/YunJing/
   if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
@@ -366,8 +373,34 @@ remove_empty_dir() {
   run rmdir -- "${path}" || return $?
 }
 
+service_files() {
+  local svc="" root="" file="" suffix=""
+  for svc in "$@"; do
+    for root in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      for suffix in service timer socket; do
+        for file in "${root}/${svc}.${suffix}" "${root}/${svc}.${suffix}.d" \
+          "${root}"/*.wants/"${svc}.${suffix}" "${root}"/*.requires/"${svc}.${suffix}"; do
+          if path_present "${file}" && ! preserved_mask "${file}"; then
+            printf '%s\n' "${file}"
+          fi
+        done
+      done
+    done
+    for file in /etc/init.d/"${svc}" \
+      /etc/rc[0-6S].d/[SK][0-9][0-9]"${svc}" /etc/rc.d/rc[0-6S].d/[SK][0-9][0-9]"${svc}" \
+      /etc/runlevels/*/"${svc}"; do
+      path_present "${file}" && printf '%s\n' "${file}"
+    done
+  done
+  return 0
+}
+
 systemd_available() {
   [[ -d /run/systemd/system ]] && command_exists systemctl
+}
+
+preserved_mask() {
+  [[ -L "$1" && "$(readlink -- "$1")" == /dev/null ]]
 }
 
 stop_services() {
@@ -394,6 +427,34 @@ stop_services() {
         run update-rc.d -f "${svc}" remove || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
       fi
     fi
+  done
+  return "${rc}"
+}
+
+cleanup_services() {
+  local file="" svc="" suffix="" state="" rc=0 query_rc=0
+  while IFS= read -r file; do
+    if [[ "${file}" == *.d ]]; then
+      remove_path "${file}" tree || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+    else
+      remove_path "${file}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+    fi
+  done < <(service_files "$@")
+  systemd_available || return "${rc}"
+  run systemctl daemon-reload || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  for svc in "$@"; do
+    for suffix in service timer socket; do
+      if query systemctl show -p ActiveState "${svc}.${suffix}"; then
+        state="${QUERY_OUTPUT}"
+      else
+        query_rc=$?
+        stop_on "${query_rc}" && return "${query_rc}"
+        continue
+      fi
+      if [[ "${state}" == ActiveState=failed ]]; then
+        run systemctl reset-failed "${svc}.${suffix}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+      fi
+    done
   done
   return "${rc}"
 }
@@ -855,6 +916,7 @@ uninstall_yunjing() {
     guard_hint
     return 6
   fi
+  cleanup_services "${YUNJING_SERVICES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   remove_paths file "${YUNJING_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   [[ "${rc}" -eq 0 ]] || return 1
@@ -883,6 +945,7 @@ uninstall_monitor() {
   fi
   stop_services "${MONITOR_SERVICES[@]}" || return $?
   stop_agent_processes "${removals[@]}" || return 1
+  cleanup_services "${MONITOR_SERVICES[@]}" || return $?
   remove_paths tree "${removals[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   for dir in "${MONITOR_DIRS[@]}"; do
     remove_empty_dir "${dir}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
@@ -892,8 +955,8 @@ uninstall_monitor() {
 }
 
 verify_uninstall() {
-  local path="" targets="" found=0
-  local -a dirs=() patterns=()
+  local path="" svc="" targets="" files="" found=0
+  local -a dirs=() services=() patterns=()
   while IFS= read -r path; do
     dirs+=("${path}")
     if path_present "${path}"; then
@@ -901,11 +964,18 @@ verify_uninstall() {
       found=1
     fi
   done < <(selected_dirs)
+  while IFS= read -r svc; do services+=("${svc}"); done < <(selected_services)
   while IFS= read -r path; do patterns+=("${path}"); done < <(selected_cron_patterns)
   targets="$(agent_processes "${dirs[@]}")" || return 1
   if [[ -n "${targets}" ]]; then
     warn "Agent processes remain:" "仍有 Agent 进程："
     show_processes "${targets}"
+    found=1
+  fi
+  files="$(service_files "${services[@]}")" || return 1
+  if [[ -n "${files}" ]]; then
+    warn "Service or startup files remain:" "仍有服务或启动文件："
+    printf '%s\n' "${files}" >&2
     found=1
   fi
   cron_remnants "${patterns[@]}" || found=1
@@ -980,7 +1050,7 @@ main() {
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     section "Verification" "验证"
     if verify_uninstall; then
-      ok "No agent files, processes or cron entries remain." "未发现 Agent 文件、进程或定时任务残留。"
+      ok "No agent files, processes, services or cron entries remain." "未发现 Agent 文件、进程、服务或定时任务残留。"
     else
       verify_rc=$?
     fi

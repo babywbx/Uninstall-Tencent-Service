@@ -21,6 +21,17 @@ class ServiceTests(UtsFixture):
         self.init_script.write_text(body)
         self.init_script.chmod(0o755)
 
+    def tat_files(self):
+        self.unit.write_text("[Service]\nExecStart=/usr/local/qcloud/tat_agent/tat_agent\n")
+        wants = self.units / "multi-user.target.wants/tat_agent.service"
+        wants.parent.mkdir()
+        wants.symlink_to(self.unit)
+        self.write_init_script()
+        rc_link = self.root / "etc/rc3.d/S88tat_agent_service"
+        rc_link.parent.mkdir()
+        rc_link.symlink_to("../init.d/tat_agent_service")
+        return [self.unit, wants, self.init_script, rc_link]
+
     def systemd_mocks(self):
         return r'''
             command_exists() { [[ "$1" == systemctl ]]; }
@@ -35,6 +46,15 @@ class ServiceTests(UtsFixture):
               fi
             }
         '''
+
+    def test_service_files_lists_tat_units_and_nothing_for_absent_ones(self):
+        files = self.tat_files()
+        result = self.run_shell('service_files tat_agent tat_agent_service tat_install')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertCountEqual(result.stdout.splitlines(), [str(path) for path in files])
+        result = self.run_shell("service_files stargate tat_install")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_init_scripts_are_deregistered_without_being_executed(self):
         self.write_init_script("#!/bin/bash\nprintf ran > /dev/null\nexit 99\n")
@@ -110,6 +130,32 @@ class ServiceTests(UtsFixture):
         )
         self.assertFalse(self.unit.is_symlink())
 
+    def test_cleanup_removes_service_files_then_reloads_systemd(self):
+        self.enable_systemd()
+        files = self.tat_files()
+        result = self.run_shell(
+            r'''
+            command_exists() { [[ "$1" == systemctl ]]; }
+            removed=$'\n'
+            run() { record "run $*"; [[ "$1" != rm ]] || removed+="$4"$'\n'; }
+            path_present() { [[ "$removed" != *$'\n'"$1"$'\n'* && ( -e "$1" || -L "$1" ) ]]; }
+            timeout() {
+              case "${@: -1}" in
+                tat_agent.service) printf 'ActiveState=failed\n' ;;
+                *) printf 'ActiveState=inactive\n' ;;
+              esac
+            }
+            cleanup_services tat_agent tat_agent_service tat_install
+            '''
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = self.events.read_text().splitlines()
+        self.assertCountEqual(events[:-2], [f"run rm -f -- {path}" for path in files])
+        self.assertEqual(
+            events[-2:],
+            ["run systemctl daemon-reload", "run systemctl reset-failed tat_agent.service"],
+        )
+
     def test_preexisting_mask_is_left_alone(self):
         self.enable_systemd()
         self.unit.symlink_to("/dev/null")
@@ -125,8 +171,12 @@ class ServiceTests(UtsFixture):
               esac
             }
             stop_services tat_agent
+            cleanup_services tat_agent
             '''
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.events.read_text().splitlines(), ["run systemctl stop tat_agent.service"])
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            ["run systemctl stop tat_agent.service", "run systemctl daemon-reload"],
+        )
         self.assertEqual(os.readlink(self.unit), "/dev/null")

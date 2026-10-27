@@ -22,6 +22,7 @@ LATER_STEPS = r"""
     root_crontab() { :; }
     stop_services() { record "stop-services $*"; }
     stop_agent_processes() { record stop-processes; }
+    cleanup_services() { record "cleanup-services $*"; }
     remove_path() { record "remove $1"; }
     remove_empty_dir() { record "remove-empty $1"; }
     INCLUDE_MONITOR=1
@@ -45,6 +46,7 @@ class YunjingTests(UtsFixture):
     local_stubs = r"""
         stop_services() { record "stop-services $*"; }
         stop_agent_processes() { record "stop-processes $*"; }
+        cleanup_services() { record "cleanup-services $*"; }
         root_crontab() { :; }
         remove_path() { record "remove $1"; }
     """
@@ -64,6 +66,7 @@ class YunjingTests(UtsFixture):
         return [
             "stop-services YDService YDLive",
             f"stop-processes {self.primary} {self.fallback}",
+            "cleanup-services YDService YDLive",
             *self.removals(),
         ]
 
@@ -259,12 +262,13 @@ class MonitorTests(UtsFixture):
                 )
                 events = self.events.read_text().splitlines()
                 self.assertEqual(
-                    events[:4],
+                    events[:5],
                     [
                         self.official(barad, "timeout -k 5 120"),
                         self.official(sgagent, "timeout -k 5 120"),
                         "stop-services stargate",
                         "stop-processes",
+                        "cleanup-services stargate",
                     ],
                 )
 
@@ -400,6 +404,7 @@ class MonitorTests(UtsFixture):
             command_exists() { [[ "$1" == systemctl ]]; }
             stop_services() { record "stop $*"; }
             stop_agent_processes() { :; }
+            cleanup_services() { :; }
             remove_path() { :; }
             remove_empty_dir() { :; }
             INCLUDE_MONITOR=1
@@ -422,6 +427,7 @@ class MonitorTests(UtsFixture):
             r"""
             root_crontab() { :; }
             stop_services() { :; }
+            cleanup_services() { :; }
             remove_path() { :; }
             remove_empty_dir() { :; }
             stop_agent_processes() { record "sweep $*"; agent_processes "$@" >/dev/null || return 1; }
@@ -440,14 +446,14 @@ class ComponentTests(UtsFixture):
     def test_timeout_stops_component_cleanup_before_later_steps(self):
         self.enable_proc()
         for component in ("yunjing", "monitor"):
-            for failing in ("remove_cron_lines", "remove_paths"):
+            for failing in ("remove_cron_lines", "cleanup_services", "remove_paths"):
                 for status in (124, 137, 143):
                     with self.subTest(component=component, failing=failing, status=status):
                         result = self.run_shell(
                             "INCLUDE_MONITOR=1\n"
                             + "remove_cron_lines() { :; }\nremove_system_cron_lines() { :; }\n"
                             + "stop_services() { :; }\nstop_agent_processes() { :; }\n"
-                            + "remove_paths() { record remove; }\n"
+                            + "cleanup_services() { :; }\nremove_paths() { record remove; }\n"
                             + f"{failing}() {{ record timed-out; return {status}; }}\n"
                             + f"uninstall_{component}\n"
                         )
@@ -464,6 +470,7 @@ class ComponentTests(UtsFixture):
             remove_cron_lines() { record cron; }
             stop_services() { record "stop-services $*"; }
             stop_agent_processes() { record "stop-processes $*"; }
+            cleanup_services() { record "cleanup-services $*"; }
             uninstall_monitor
             """
         )
@@ -523,15 +530,16 @@ class ComponentTests(UtsFixture):
             with self.subTest(monitor=monitor):
                 result = self.run_shell(
                     f"INCLUDE_MONITOR={monitor}\n"
-                    "selected_dirs; echo ---; "
+                    "selected_dirs; echo ---; selected_services; echo ---; "
                     "selected_cron_patterns; echo ---; selected_leftovers"
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "")
-                dirs, patterns, leftovers = (
+                dirs, services, patterns, leftovers = (
                     part.splitlines() for part in result.stdout.split("---\n")
                 )
                 self.assertEqual(dirs, [str(path) for path in yunjing_dirs + monitor_dirs * monitor])
+                self.assertEqual(services, ["YDService", "YDLive"] + ["stargate"] * monitor)
                 self.assertEqual(
                     patterns,
                     ["/qcloud/YunJing/"]

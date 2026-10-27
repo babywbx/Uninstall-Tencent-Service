@@ -441,7 +441,7 @@ class MainTests(UtsFixture):
             "==> Host Security agent (YunJing)",
             "==> Cloud Monitor (BaradAgent / Sgagent)",
             "==> Verification",
-            "[ OK ] No agent files, processes or cron entries remain.",
+            "[ OK ] No agent files, processes, services or cron entries remain.",
             "[ OK ] Uninstall-Tencent-Service: local uninstall verified.",
         ]
         for reply, proceeds in (("y", True), ("yes", True), ("YES", True), ("n", False), ("", False), ("yess", False)):
@@ -663,6 +663,15 @@ class VerifyTests(UtsFixture):
         self.assert_failed(result)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("Cannot inspect command line for PID 900002.", result.stderr)
+
+    def test_remaining_init_script_fails_verification(self):
+        script = self.root / "etc/init.d/YDService"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\n")
+        result = self.run_shell(self.verify())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Service or startup files remain:", result.stderr)
+        self.assertIn(str(script), result.stderr)
 
     def test_cron_entry_in_unrelated_file_fails_verification(self):
         cron = self.root / "etc/cron.d/other"
