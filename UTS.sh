@@ -9,6 +9,8 @@ COMMAND_TIMEOUT=120
 TIMEOUT_KILL=(-k 5)
 FAILURES=0
 RUN_PID=""
+QUERY_OUTPUT=""
+QUERY_ERROR=""
 LOCK_DIR="/run/uts.lock"
 PROC_ROOT="/proc"
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
@@ -143,6 +145,22 @@ section() {
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+query() {
+  local output="" errors="" rc=0
+  QUERY_OUTPUT=""
+  QUERY_ERROR=""
+  output="$(mktemp "${WORKDIR:-${TMPDIR:-/tmp}}/uts-query.XXXXXX")" || return 1
+  errors="$(mktemp "${WORKDIR:-${TMPDIR:-/tmp}}/uts-query.XXXXXX")" || { command rm -f -- "${output}"; return 1; }
+  timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null 9>&- >"${output}" 2>"${errors}" &
+  RUN_PID=$!
+  wait "${RUN_PID}" || rc=$?
+  RUN_PID=""
+  QUERY_OUTPUT="$(cat -- "${output}")" || { command rm -f -- "${output}" "${errors}"; return 1; }
+  QUERY_ERROR="$(cat -- "${errors}")" || { command rm -f -- "${output}" "${errors}"; return 1; }
+  command rm -f -- "${output}" "${errors}" || return 1
+  return "${rc}"
 }
 
 run() {
@@ -527,6 +545,108 @@ stop_agent_processes() {
   return 1
 }
 
+root_crontab() {
+  local diagnostic="" file="" rc=0
+  LC_ALL=C query crontab -u root -l || rc=$?
+  diagnostic="${QUERY_ERROR}"
+  if [[ "${rc}" -ne 0 ]]; then
+    stop_on "${rc}" && return "${rc}"
+    [[ ( "${rc}" -eq 1 || "${rc}" -eq 2 ) && -z "${QUERY_OUTPUT}" ]] || return 1
+    case "${diagnostic}" in
+      'no crontab for root'|"crontab: can't open 'root': No such file or directory") ;;
+      *) return 1 ;;
+    esac
+    for file in /var/spool/cron/root /var/spool/cron/crontabs/root; do
+      [[ ! -s "${file}" ]] || return 1
+    done
+    return 0
+  fi
+  return 0
+}
+
+cron_agent_line() {
+  local line="$1" minute="" hour="" day="" month="" weekday="" command="" pattern="" prefix="" directory="" executable="" inspection="" redirect='2>&1'
+  local macro_re='^[[:space:]]*@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)[[:space:]]+(.+)$'
+  local executable_re="^['\"]?([^[:space:]'\";&|]+)['\"]?([[:space:]].*)?$"
+  local -a directories=("${YUNJING_DIRS[@]}" "${STARGATE_DIRS[@]}")
+  shift
+  if [[ "${line}" =~ ${macro_re} ]]; then
+    command="${BASH_REMATCH[2]}"
+  else
+    read -r minute hour day month weekday command <<<"${line}"
+    for pattern in "${minute}" "${hour}" "${day}" "${month}" "${weekday}"; do
+      [[ "${pattern}" =~ ^[[:alnum:]*/,-]+$ ]] || return 1
+    done
+  fi
+  command="${command#"${command%%[![:space:]]*}"}"
+  inspection="${command//"${redirect}"/}"
+  inspection="${inspection%"${inspection##*[![:space:]]}"}"
+  inspection="${inspection%&}"
+  if [[ "${command}" == *'$'* || "${command}" == *'`'* || "${command}" == *\\* \
+    || "${command}" == *';'* || "${inspection}" == *'&'* || "${command}" == *'|'* ]]; then
+    for pattern in "$@"; do [[ "${command}" != *"${pattern}"* ]] || return 2; done
+    return 1
+  fi
+  command="${command%"${command##*[![:space:]]}"}"
+  command="${command%&}"
+  [[ "${command}" =~ ${executable_re} ]] || return 1
+  executable="${BASH_REMATCH[1]}"
+  [[ "${executable}" == /* ]] || return 1
+  executable="$(resolved_path "${executable}")" || return 1
+  for directory in "${MONITOR_DIRS[@]}"; do directories+=("${directory}/barad"); done
+  for pattern in "$@"; do
+    for prefix in usr/local var/lib; do
+      [[ "${executable}" != "/${prefix}${pattern}"* ]] || return 0
+    done
+    for directory in "${directories[@]}"; do
+      if [[ "${directory}/" == *"${pattern}" && "${executable}" == "${directory}/"* ]]; then return 0; fi
+    done
+  done
+  return 1
+}
+
+remove_cron_lines() {
+  local current="" latest="" kept="" line="" removed=0 file="" rc=0
+  command_exists crontab || return 0
+  QUERY_OUTPUT=""
+  root_crontab || { rc=$?; warn "Cannot read the root crontab." "无法读取 root crontab。"; return "${rc}"; }
+  current="${QUERY_OUTPUT}"
+  [[ -n "${current}" ]] || return 0
+  while IFS= read -r line; do
+    if cron_agent_line "${line}" "$@"; then
+      removed=1
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        preview "remove root crontab line: ${line}" "删除 root crontab 行：${line}"
+      else
+        log "Removing root crontab line: ${line}" "正在删除 root crontab 行：${line}"
+      fi
+      continue
+    else
+      rc=$?
+      if [[ "${rc}" -eq 2 ]]; then
+        warn "Complex agent cron command requires manual review; root crontab was preserved: ${line}" "Agent 定时任务较复杂，需要人工检查，已保留 root crontab：${line}"
+        return 1
+      fi
+    fi
+    kept+="${line}"$'\n'
+  done <<<"${current}"
+  [[ "${removed}" -eq 1 && "${DRY_RUN}" -eq 0 ]] || return 0
+  QUERY_OUTPUT=""
+  root_crontab || { rc=$?; warn "Cannot recheck the root crontab." "无法复查 root crontab。"; return "${rc}"; }
+  latest="${QUERY_OUTPUT}"
+  if [[ "${latest}" != "${current}" ]]; then
+    warn "Root crontab changed during cleanup; preserving the newer version." "清理期间 root crontab 有变化，保留较新版本。"
+    return 1
+  fi
+  if [[ -z "${kept//[[:space:]]/}" ]]; then
+    run crontab -u root -r || return $?
+    return 0
+  fi
+  file="${WORKDIR}/crontab"
+  printf '%s' "${kept}" >"${file}" || return 1
+  run crontab -u root "${file}" || return $?
+}
+
 remove_paths() {
   local kind="$1" path="" rc=0
   shift
@@ -556,6 +676,7 @@ uninstall_yunjing() {
     warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
     return "${official_rc}"
   fi
+  remove_cron_lines /qcloud/YunJing/ || return $?
   if ! stop_agent_processes "${YUNJING_DIRS[@]}"; then
     guard_hint
     return 6
@@ -581,6 +702,7 @@ uninstall_monitor() {
     path_present "${path}" || continue
     run_local_script "${path}" "Sgagent " || return $?
   done
+  remove_cron_lines /qcloud/stargate/ /qcloud/monitor/barad/ || return $?
   stop_agent_processes "${removals[@]}" || return 1
   remove_paths tree "${removals[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   for dir in "${MONITOR_DIRS[@]}"; do

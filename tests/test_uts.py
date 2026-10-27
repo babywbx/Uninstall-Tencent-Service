@@ -320,6 +320,12 @@ class MainTests(UtsFixture):
             self.real_function("run")
             + r"""
             stat() { printf '0\n'; }
+            root_crontab() {
+              QUERY_OUTPUT="$(
+              printf '%s\n' "*/5 * * * * ${STARGATE_DIRS[0]}/admin/start.sh > /dev/null 2>&1 &"
+              printf '%s\n' "0 3 * * * /usr/local/bin/backup.sh"
+              )"
+            }
             verify_uninstall() { record verify; }
             main --dry-run --include-monitor
             """
@@ -330,6 +336,7 @@ class MainTests(UtsFixture):
             f"[DRY-RUN] would run official {yunjing}/uninst.sh",
             f"[DRY-RUN] would run official BaradAgent {barad}/admin/uninstall.sh",
             f"[DRY-RUN] would run official Sgagent {stargate}/admin/uninstall.sh",
+            f"[DRY-RUN] remove root crontab line: */5 * * * * {stargate}/admin/start.sh",
             f"[DRY-RUN] rm -rf -- {yunjing}",
             f"[DRY-RUN] rm -rf -- {stargate}",
             f"[DRY-RUN] rm -rf -- {barad}",
@@ -574,6 +581,7 @@ class MainTests(UtsFixture):
                     result = self.run_shell(
                         stubs
                         + "agent_processes() { :; }\n"
+                        + "remove_cron_lines() { :; }\n"
                         + "stop_agent_processes() { :; }\n"
                         + f"remove_paths() {{ record cleanup-timeout; return {status}; }}\n"
                         + "verify_uninstall() { record verify; }\n"
@@ -618,6 +626,7 @@ class VerifyTests(UtsFixture):
     def main(self):
         return (
             'timeout() { shift 3; "$@"; }\n'
+            "crontab() { printf 'no crontab for root\\n' >&2; return 1; }\n"
             "main --yes --include-monitor\n"
         )
 

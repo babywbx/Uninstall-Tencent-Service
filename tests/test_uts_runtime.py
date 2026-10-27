@@ -144,7 +144,10 @@ class InterruptTests(UtsFixture):
     def test_interrupt_stops_term_ignoring_child_and_preserves_bystander(self):
         self.check_interrupt_cleanup()
 
-    def check_interrupt_cleanup(self):
+    def test_interrupt_stops_root_crontab_query_without_waiting_for_deadline(self):
+        self.check_interrupt_cleanup(query="crontab")
+
+    def check_interrupt_cleanup(self, query=False):
         binaries = self.base / "bin"
         binaries.mkdir()
         timeout_pid = self.base / "timeout.pid"
@@ -166,10 +169,20 @@ class InterruptTests(UtsFixture):
             + "COMMAND_TIMEOUT=6\n"
             + "TIMEOUT_KILL=(-k 1)\n"
         )
-        body += (
-            f"run {shlex.quote(BASH)} -c {shlex.quote(child_command)} "
-            + f"uts-interrupt {shlex.quote(str(child_pid))}\n"
-        )
+        if query:
+            self.vendor_script(
+                binaries / "crontab",
+                f"#!{BASH}\n"
+                + 'trap "" TERM\n'
+                + f'printf "%s\\n" "$$" > {shlex.quote(str(child_pid))}\n'
+                + "exec sleep 30\n",
+            )
+            body += "remove_cron_lines /qcloud/YunJing/\n"
+        else:
+            body += (
+                f"run {shlex.quote(BASH)} -c {shlex.quote(child_command)} "
+                + f"uts-interrupt {shlex.quote(str(child_pid))}\n"
+            )
         environment = {
             "PATH": str(binaries) + os.pathsep + os.environ.get("PATH", os.defpath),
             "HOME": str(self.base),

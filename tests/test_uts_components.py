@@ -9,6 +9,7 @@ from test_uts import EXECUTE, ROOT_STAT, UtsFixture
 ELF = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 56
 MOCKS = r"""
     stat() { printf '0\n'; }
+    root_crontab() { :; }
     run() {
       record "run $*"
       case "$1" in
@@ -18,6 +19,7 @@ MOCKS = r"""
     INCLUDE_MONITOR=1
 """
 LATER_STEPS = r"""
+    root_crontab() { :; }
     stop_agent_processes() { record stop-processes; }
     remove_path() { record "remove $1"; }
     remove_empty_dir() { record "remove-empty $1"; }
@@ -41,6 +43,7 @@ def install_monitor(root, prefix, scripts=True):
 class YunjingTests(UtsFixture):
     local_stubs = r"""
         stop_agent_processes() { record "stop-processes $*"; }
+        root_crontab() { :; }
         remove_path() { record "remove $1"; }
     """
 
@@ -158,12 +161,29 @@ class YunjingTests(UtsFixture):
                 self.assertEqual(self.events.read_text().splitlines(), official)
                 self.assertTrue(script.is_file())
 
-    def test_missing_uninstaller_still_cleans_local_remnants(self):
+    def test_missing_uninstaller_still_cleans_dirs_and_cron_lines(self):
         self.primary.mkdir(parents=True)
-        result = self.run_shell(self.local_stubs + "uninstall_yunjing\n")
+        result = self.run_shell(
+            self.local_stubs
+            + r"""
+            WORKDIR="$UTS_TEST_ROOT/tmp"
+            root_crontab() {
+              QUERY_OUTPUT="$(
+              printf '%s\n' "0 0 * * * ${YUNJING_DIRS[0]}/YDCrontab.sh > /dev/null 2>&1 &"
+              printf '%s\n' "0 3 * * * /usr/local/bin/backup.sh"
+              )"
+            }
+            uninstall_yunjing
+            """
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("No official uninst.sh found; cleaning local remnants only.", result.stdout)
-        self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
+        self.assertIn(f"Removing root crontab line: 0 0 * * * {self.primary}/YDCrontab.sh", result.stdout)
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            [f"run crontab -u root {self.root}/tmp/crontab", *self.local_cleanup()],
+        )
+        self.assertEqual((self.root / "tmp/crontab").read_text(), "0 3 * * * /usr/local/bin/backup.sh\n")
 
     def test_unstoppable_processes_return_6_with_console_hint(self):
         result = self.run_shell(
@@ -296,6 +316,45 @@ class MonitorTests(UtsFixture):
                 self.assertEqual(keep.read_text(), "keep\n")
                 self.assertFalse(stargate.exists())
 
+    def test_cron_entries_are_removed_before_services_and_processes_stop(self):
+        other = "*/5 * * * * /usr/local/qcloud/monitor/other/agent.sh"
+        result = self.run_shell(
+            MOCKS
+            + r"""
+            WORKDIR="$UTS_TEST_ROOT/tmp"
+            root_crontab() {
+              QUERY_OUTPUT="$(
+              printf '%s\n' "*/5 * * * * ${STARGATE_DIRS[0]}/admin/start.sh > /dev/null 2>&1 &"
+              printf '%s\n' "*/5 * * * * ${MONITOR_DIRS[0]}/barad/admin/trystart.sh"
+              printf '%s\n' "0 3 * * * /usr/local/bin/backup.sh"
+              printf '%s\n' "*/5 * * * * /usr/local/qcloud/monitor/other/agent.sh"
+              )"
+            }
+            stop_agent_processes() { record "processes $*"; }
+            uninstall_monitor
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        scanned = " ".join(
+            f"{self.root}/{path}"
+            for path in (
+                "usr/local/qcloud/stargate",
+                "var/lib/qcloud/stargate",
+                "usr/local/qcloud/monitor/barad",
+                "var/lib/qcloud/monitor/barad",
+            )
+        )
+        events = self.events.read_text().splitlines()
+        self.assertEqual(events[:2], [
+            f"run crontab -u root {self.root}/tmp/crontab",
+            f"processes {scanned}",
+        ])
+        self.assertEqual(
+            (self.root / "tmp/crontab").read_text(),
+            f"0 3 * * * /usr/local/bin/backup.sh\n{other}\n",
+        )
+        self.assertEqual(result.stdout.count("Removing root crontab line:"), 2)
+
     def test_lock_and_pid_files_are_removed(self):
         leftovers = self.leftovers()
         result = self.run_shell(MOCKS + 'WORKDIR="$UTS_TEST_ROOT/tmp"\nuninstall_monitor')
@@ -315,6 +374,7 @@ class MonitorTests(UtsFixture):
         self.process(900001, other, [other])
         result = self.run_shell(
             r"""
+            root_crontab() { :; }
             remove_path() { :; }
             remove_empty_dir() { :; }
             stop_agent_processes() { record "sweep $*"; agent_processes "$@" >/dev/null || return 1; }
@@ -333,11 +393,12 @@ class ComponentTests(UtsFixture):
     def test_timeout_stops_component_cleanup_before_later_steps(self):
         self.enable_proc()
         for component in ("yunjing", "monitor"):
-            for failing in ("remove_paths",):
+            for failing in ("remove_cron_lines", "remove_paths"):
                 for status in (124, 137, 143):
                     with self.subTest(component=component, failing=failing, status=status):
                         result = self.run_shell(
                             "INCLUDE_MONITOR=1\n"
+                            + "remove_cron_lines() { :; }\n"
                             + "stop_agent_processes() { :; }\n"
                             + "remove_paths() { record remove; }\n"
                             + f"{failing}() {{ record timed-out; return {status}; }}\n"
@@ -351,6 +412,7 @@ class ComponentTests(UtsFixture):
         before = self.file_snapshot()
         result = self.run_shell(
             r"""
+            remove_cron_lines() { record cron; }
             stop_agent_processes() { record "stop-processes $*"; }
             uninstall_monitor
             """
@@ -359,6 +421,26 @@ class ComponentTests(UtsFixture):
         self.assertEqual(result.stdout + result.stderr, "")
         self.assertEqual(self.events.read_text(), "")
         self.assertEqual(before, self.file_snapshot())
+
+    def test_cron_failure_stops_component_before_services(self):
+        yunjing = self.root / "usr/local/qcloud/YunJing"
+        yunjing.mkdir(parents=True)
+        install_monitor(self.root, "usr/local/qcloud", scripts=False)
+        before = self.file_snapshot()
+        for component in ("yunjing", "monitor"):
+            with self.subTest(component=component):
+                result = self.run_shell(
+                    r"""
+                    INCLUDE_MONITOR=1
+                    root_crontab() { :; }
+                    stop_agent_processes() { record processes; }
+                    remove_cron_lines() { record "failed remove_cron_lines"; return 1; }
+                    """
+                    + f"uninstall_{component}\n"
+                )
+                self.assert_failed(result)
+                self.assertEqual(self.events.read_text(), "failed remove_cron_lines\n")
+                self.assertEqual(before, self.file_snapshot())
 
     def test_selection_helpers_follow_component_flags(self):
         yunjing_dirs = [
