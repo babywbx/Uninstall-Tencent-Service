@@ -314,6 +314,8 @@ class MainTests(UtsFixture):
         self.vendor_script(stargate / "admin/uninstall.sh", "#!/bin/bash\nexit 0\n")
         barad = self.root / "usr/local/qcloud/monitor/barad"
         self.vendor_script(barad / "admin/uninstall.sh", "#!/bin/bash\nexit 0\n")
+        (self.root / "etc/cron.d").mkdir()
+        (self.root / "etc/cron.d/sgagenttask").write_text("* * * * * root start.sh\n")
         self.enable_proc()
         before = self.file_snapshot()
         result = self.run_shell(
@@ -582,6 +584,7 @@ class MainTests(UtsFixture):
                         stubs
                         + "agent_processes() { :; }\n"
                         + "remove_cron_lines() { :; }\n"
+                        + "remove_system_cron_lines() { :; }\n"
                         + "stop_agent_processes() { :; }\n"
                         + f"remove_paths() {{ record cleanup-timeout; return {status}; }}\n"
                         + "verify_uninstall() { record verify; }\n"

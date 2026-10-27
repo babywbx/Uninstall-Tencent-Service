@@ -565,11 +565,11 @@ root_crontab() {
 }
 
 cron_agent_line() {
-  local line="$1" minute="" hour="" day="" month="" weekday="" command="" pattern="" prefix="" directory="" executable="" inspection="" redirect='2>&1'
+  local line="$1" system_file="$2" minute="" hour="" day="" month="" weekday="" command="" user="" pattern="" prefix="" directory="" executable="" inspection="" redirect='2>&1'
   local macro_re='^[[:space:]]*@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)[[:space:]]+(.+)$'
   local executable_re="^['\"]?([^[:space:]'\";&|]+)['\"]?([[:space:]].*)?$"
   local -a directories=("${YUNJING_DIRS[@]}" "${STARGATE_DIRS[@]}")
-  shift
+  shift 2
   if [[ "${line}" =~ ${macro_re} ]]; then
     command="${BASH_REMATCH[2]}"
   else
@@ -577,6 +577,10 @@ cron_agent_line() {
     for pattern in "${minute}" "${hour}" "${day}" "${month}" "${weekday}"; do
       [[ "${pattern}" =~ ^[[:alnum:]*/,-]+$ ]] || return 1
     done
+  fi
+  if [[ "${system_file}" -eq 1 ]]; then
+    read -r user command <<<"${command}"
+    [[ -n "${user}" ]] || return 1
   fi
   command="${command#"${command%%[![:space:]]*}"}"
   inspection="${command//"${redirect}"/}"
@@ -613,7 +617,7 @@ remove_cron_lines() {
   current="${QUERY_OUTPUT}"
   [[ -n "${current}" ]] || return 0
   while IFS= read -r line; do
-    if cron_agent_line "${line}" "$@"; then
+    if cron_agent_line "${line}" 0 "$@"; then
       removed=1
       if [[ "${DRY_RUN}" -eq 1 ]]; then
         preview "remove root crontab line: ${line}" "删除 root crontab 行：${line}"
@@ -647,6 +651,47 @@ remove_cron_lines() {
   run crontab -u root "${file}" || return $?
 }
 
+remove_system_cron_lines() {
+  local path="$1" current="" latest="" kept="" line="" replacement="" removed=0 rc=0
+  shift
+  path_present "${path}" || return 0
+  if [[ ! -f "${path}" || -L "${path}" ]]; then
+    warn "Refusing non-regular system cron file: ${path}." "拒绝处理非普通文件的系统定时任务：${path}。"
+    return 1
+  fi
+  current="$(cat -- "${path}")" || return 1
+  while IFS= read -r line; do
+    if cron_agent_line "${line}" 1 "$@"; then
+      removed=1
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        preview "remove ${path} line: ${line}" "删除 ${path} 中的行：${line}"
+      else
+        log "Removing ${path} line: ${line}" "正在删除 ${path} 中的行：${line}"
+      fi
+    else
+      rc=$?
+      if [[ "${rc}" -eq 2 ]]; then
+        warn "Complex agent cron command requires manual review; ${path} was preserved: ${line}" "Agent 定时任务较复杂，需要人工检查，已保留 ${path}：${line}"
+        return 1
+      fi
+      kept+="${line}"$'\n'
+    fi
+  done <<<"${current}"
+  [[ "${removed}" -eq 1 && "${DRY_RUN}" -eq 0 ]] || return 0
+  latest="$(cat -- "${path}")" || return 1
+  [[ ! -L "${path}" && "${latest}" == "${current}" ]] || { warn "System cron file changed during cleanup: ${path}." "清理期间系统定时任务文件有变化：${path}。"; return 1; }
+  if [[ -z "${kept//[[:space:]]/}" ]]; then remove_path "${path}"; return $?; fi
+  replacement="$(mktemp "${path%/*}/.uts-cron.XXXXXX")" || return 1
+  if ! cp -p -- "${path}" "${replacement}" || ! printf '%s' "${kept}" >"${replacement}"; then
+    rm -f -- "${replacement}"
+    return 1
+  fi
+  rc=0
+  run mv -f -- "${replacement}" "${path}" || rc=$?
+  rm -f -- "${replacement}"
+  return "${rc}"
+}
+
 remove_paths() {
   local kind="$1" path="" rc=0
   shift
@@ -677,6 +722,7 @@ uninstall_yunjing() {
     return "${official_rc}"
   fi
   remove_cron_lines /qcloud/YunJing/ || return $?
+  remove_system_cron_lines /etc/cron.d/yunjing /qcloud/YunJing/ || return $?
   if ! stop_agent_processes "${YUNJING_DIRS[@]}"; then
     guard_hint
     return 6
@@ -703,6 +749,7 @@ uninstall_monitor() {
     run_local_script "${path}" "Sgagent " || return $?
   done
   remove_cron_lines /qcloud/stargate/ /qcloud/monitor/barad/ || return $?
+  remove_system_cron_lines /etc/cron.d/sgagenttask /qcloud/stargate/ || return $?
   stop_agent_processes "${removals[@]}" || return 1
   remove_paths tree "${removals[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   for dir in "${MONITOR_DIRS[@]}"; do

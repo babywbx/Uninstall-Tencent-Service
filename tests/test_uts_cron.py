@@ -1,4 +1,6 @@
+import os
 import shlex
+import stat
 
 from test_uts import UtsFixture
 
@@ -21,6 +23,15 @@ COMPOUND_COMMANDS = (
     "/opt/backup.sh && /usr/local/qcloud/YunJing/YDCrontab.sh",
     "/usr/local/qcloud/YunJing/YDCrontab.sh & /opt/backup.sh",
     "/usr/local/qcloud/YunJing/YDCrontab.sh 2>&1 & /opt/backup.sh &",
+)
+YUNJING_JOBS = (
+    "*/30 * * * * root /usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1\n"
+    "@reboot root /usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1\n"
+)
+KEEP_JOBS = (
+    "SHELL=/bin/bash\n"
+    "# unrelated backup\n"
+    "0 3 * * * root /opt/backup --exclude=/usr/local/qcloud/YunJing/\n"
 )
 
 
@@ -189,3 +200,104 @@ class RootCrontabTests(UtsFixture):
                 self.assertEqual(self.events.read_text(), "")
                 self.assertEqual(self.listing.read_text(), line)
                 self.assertFalse(self.written.exists())
+
+
+class SystemCronTests(UtsFixture):
+    def setUp(self):
+        super().setUp()
+        self.cron = self.root / "etc/cron.d/yunjing"
+        self.cron.parent.mkdir()
+
+    def clean(self, prefix=""):
+        return self.run_shell(
+            r'''
+            run() {
+              record "run $*"
+              case "$1" in mv|rm) ;; *) blocked run "$@"; return 97 ;; esac
+              [[ "${@: -1}" == "$UTS_TEST_ROOT/"* ]] || { blocked run "$@"; return 97; }
+              if [[ "$1" == mv ]]; then
+                [[ "$4" == "$UTS_TEST_ROOT/"* ]] || { blocked run "$@"; return 97; }
+              fi
+              command "$@"
+            }
+            '''
+            + prefix
+            + '\nremove_system_cron_lines "$UTS_TEST_ROOT/etc/cron.d/yunjing" /qcloud/YunJing/\n'
+        )
+
+    def test_official_schedule_is_removed_and_empty_file_deleted(self):
+        self.cron.write_text(YUNJING_JOBS)
+        result = self.clean()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.cron.exists())
+        self.assertEqual(result.stdout.count("Removing "), 2)
+        self.assertEqual(self.events.read_text(), f"run rm -f -- {self.cron}\n")
+
+    def test_mixed_jobs_and_permissions_are_preserved(self):
+        self.cron.write_text(YUNJING_JOBS + KEEP_JOBS)
+        self.cron.chmod(0o640)
+        owner = self.cron.stat().st_uid
+        result = self.clean()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.cron.read_text(), KEEP_JOBS)
+        self.assertEqual(stat.S_IMODE(self.cron.stat().st_mode), 0o640)
+        self.assertEqual(self.cron.stat().st_uid, owner)
+        self.assertFalse(list(self.cron.parent.glob(".uts-cron.*")))
+
+    def test_dry_run_preserves_contents_and_permissions(self):
+        self.cron.write_text(YUNJING_JOBS + KEEP_JOBS)
+        self.cron.chmod(0o600)
+        before = self.file_snapshot()
+        result = self.clean("exec 3>&1\nDRY_RUN=1\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("[DRY-RUN] remove"), 2)
+        self.assertEqual(self.events.read_text(), "")
+        self.assertEqual(self.file_snapshot(), before)
+
+    def test_non_regular_file_is_rejected_untouched(self):
+        target = self.root / "var/important.cron"
+        target.write_text(YUNJING_JOBS + KEEP_JOBS)
+        for kind in ("symlink", "directory"):
+            with self.subTest(kind=kind):
+                if kind == "symlink":
+                    self.cron.symlink_to(target)
+                else:
+                    self.cron.unlink()
+                    self.cron.mkdir()
+                    (self.cron / "important.txt").write_text("keep\n")
+                result = self.clean()
+                self.assert_failed(result)
+                self.assertIn("Refusing non-regular system cron file", result.stderr)
+                self.assertEqual(self.events.read_text(), "")
+                self.assertEqual(target.read_text(), YUNJING_JOBS + KEEP_JOBS)
+                if kind == "symlink":
+                    self.assertTrue(self.cron.is_symlink())
+                else:
+                    self.assertEqual((self.cron / "important.txt").read_text(), "keep\n")
+
+    def test_hardlinked_original_is_preserved_when_replacing_mixed_file(self):
+        target = self.root / "var/important.cron"
+        target.write_text(YUNJING_JOBS + KEEP_JOBS)
+        target.chmod(0o640)
+        os.link(target, self.cron)
+        original_inode = target.stat().st_ino
+        result = self.clean()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(target.read_text(), YUNJING_JOBS + KEEP_JOBS)
+        self.assertEqual(target.stat().st_ino, original_inode)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+        self.assertEqual(self.cron.read_text(), KEEP_JOBS)
+        self.assertNotEqual(self.cron.stat().st_ino, original_inode)
+
+    def test_compound_agent_jobs_abort_without_partial_edits(self):
+        for command in COMPOUND_COMMANDS:
+            with self.subTest(command=command):
+                original = YUNJING_JOBS + f"0 * * * * root {command}\n" + KEEP_JOBS
+                self.cron.write_text(original)
+                self.cron.chmod(0o640)
+                result = self.clean()
+                self.assert_failed(result)
+                self.assertEqual(self.cron.read_text(), original)
+                self.assertEqual(stat.S_IMODE(self.cron.stat().st_mode), 0o640)
+                self.assertEqual(self.events.read_text(), "")
+                self.assertFalse(list(self.cron.parent.glob(".uts-cron.*")))
