@@ -386,7 +386,7 @@ service_files() {
         done
       done
     done
-    for file in /etc/init.d/"${svc}" \
+    for file in /etc/init.d/"${svc}" /etc/init/"${svc}".conf /etc/init/"${svc}".override \
       /etc/rc[0-6S].d/[SK][0-9][0-9]"${svc}" /etc/rc.d/rc[0-6S].d/[SK][0-9][0-9]"${svc}" \
       /etc/runlevels/*/"${svc}"; do
       path_present "${file}" && printf '%s\n' "${file}"
@@ -403,8 +403,39 @@ preserved_mask() {
   [[ -L "$1" && "$(readlink -- "$1")" == /dev/null ]]
 }
 
+upstart_stop_hooks() {
+  local file="" rc=0
+  for file in "/etc/init/$1.conf" "/etc/init/$1.override"; do
+    path_present "${file}" || continue
+    [[ -f "${file}" && -r "${file}" ]] || return 0
+    rc=0
+    grep -Eq '^[[:space:]]*(pre-stop|post-stop)([[:space:]]|$)' -- "${file}" || rc=$?
+    [[ "${rc}" -eq 1 ]] || return 0
+  done
+  return 1
+}
+
 stop_services() {
   local svc="" suffix="" state="" rc=0
+  for svc in "$@"; do
+    if command_exists initctl && [[ -f "/etc/init/${svc}.conf" ]] && upstart_stop_hooks "${svc}"; then
+      warn "Upstart job ${svc} has vendor stop hooks; preserving this component." "Upstart 任务 ${svc} 带有厂商停止钩子，保留此组件。"
+      return 1
+    fi
+  done
+  for svc in "$@"; do
+    if command_exists initctl && [[ -f "/etc/init/${svc}.conf" ]]; then
+      rc=0
+      query initctl status "${svc}" || rc=$?
+      stop_on "${rc}" && return "${rc}"
+      state="${QUERY_OUTPUT}"
+      [[ "${rc}" -eq 0 ]] || state=""
+      rc=0
+      if [[ "${state}" == *" start/"* ]]; then
+        run initctl stop "${svc}" || return $?
+      fi
+    fi
+  done
   for svc in "$@"; do
     if systemd_available; then
       for suffix in socket timer service; do

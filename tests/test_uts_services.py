@@ -5,6 +5,14 @@ import subprocess
 from test_uts import UtsFixture
 
 
+VENDOR_UPSTART = (
+    'description "TAT agent"\nauthor "Tencent Cloud"\n\n'
+    "start on runlevel [2345]\nstop on runlevel [!2345]\n\n"
+    "respawn\nrespawn limit unlimited\n\nexpect daemon\n\n"
+    "pre-start exec sleep 0.2\nexec /usr/local/qcloud/tat_agent/tat_agent\n"
+)
+
+
 class ServiceTests(UtsFixture):
     def setUp(self):
         super().setUp()
@@ -12,6 +20,7 @@ class ServiceTests(UtsFixture):
         self.units.mkdir(parents=True)
         self.unit = self.units / "tat_agent.service"
         self.init_script = self.root / "etc/init.d/tat_agent_service"
+        self.upstart_conf = self.root / "etc/init/tat_agent_service.conf"
 
     def enable_systemd(self):
         (self.root / "run/systemd/system").mkdir(parents=True, exist_ok=True)
@@ -27,10 +36,12 @@ class ServiceTests(UtsFixture):
         wants.parent.mkdir()
         wants.symlink_to(self.unit)
         self.write_init_script()
+        self.upstart_conf.parent.mkdir()
+        self.upstart_conf.write_text('description "TAT agent"\n')
         rc_link = self.root / "etc/rc3.d/S88tat_agent_service"
         rc_link.parent.mkdir()
         rc_link.symlink_to("../init.d/tat_agent_service")
-        return [self.unit, wants, self.init_script, rc_link]
+        return [self.unit, wants, self.init_script, self.upstart_conf, rc_link]
 
     def systemd_mocks(self):
         return r'''
@@ -118,6 +129,59 @@ class ServiceTests(UtsFixture):
             if bystander.poll() is None:
                 bystander.terminate()
             bystander.wait(timeout=3)
+
+    def test_upstart_jobs_with_stop_hooks_are_refused_for_every_selected_component(self):
+        self.write_init_script()
+        (self.root / "etc/init.d/stargate").write_text("#!/bin/sh\nexit 0\n")
+        self.upstart_conf.parent.mkdir()
+        override = self.root / "etc/init/tat_agent_service.override"
+        for case, conf, override_kind in (
+            ("post-stop script", "post-stop script\n  exit 0\nend script\n", None),
+            ("pre-stop exec", "respawn\n  pre-stop exec /usr/local/qcloud/tat_agent/stop.sh\n", None),
+            ("override hook", VENDOR_UPSTART, "post-stop exec /bin/true\n"),
+            ("unreadable override", VENDOR_UPSTART, "directory"),
+        ):
+            with self.subTest(case=case):
+                self.upstart_conf.write_text(conf)
+                if override.is_dir():
+                    override.rmdir()
+                override.unlink(missing_ok=True)
+                if override_kind == "directory":
+                    override.mkdir()
+                elif override_kind:
+                    override.write_text(override_kind)
+                before = self.file_snapshot()
+                for services in ("tat_agent tat_agent_service tat_install", "stargate tat_agent_service"):
+                    result = self.run_shell(
+                        'command_exists() { [[ "$1" == initctl || "$1" == update-rc.d ]]; }\n'
+                        f"stop_services {services}\n"
+                    )
+                    self.assert_failed(result)
+                    self.assertIn("Upstart job tat_agent_service has vendor stop hooks", result.stderr)
+                    self.assertEqual(self.events.read_text(), "")
+                    self.assertEqual(before, self.file_snapshot())
+
+    def test_upstart_job_without_stop_hooks_is_stopped_with_initctl(self):
+        self.upstart_conf.parent.mkdir()
+        self.upstart_conf.write_text(VENDOR_UPSTART)
+        for state, expected in (
+            ("tat_agent_service start/running, process 1506", ["run initctl stop tat_agent_service"]),
+            ("tat_agent_service stop/waiting", []),
+            ("", []),
+        ):
+            with self.subTest(state=state):
+                result = self.run_shell(
+                    'command_exists() { [[ "$1" == initctl ]]; }\n'
+                    "timeout() {\n"
+                    '  [[ "$*" == "-k 5 120 initctl status tat_agent_service" ]] || { blocked timeout "$@"; return 97; }\n'
+                    f"  [[ -n {shlex.quote(state)} ]] || return 1\n"
+                    f"  printf '%s\\n' {shlex.quote(state)}\n"
+                    "}\n"
+                    'stop_services tat_agent tat_agent_service tat_install\n'
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), expected)
+                self.assertTrue(self.upstart_conf.is_file())
 
     def test_loaded_unit_is_stopped_and_disabled_while_missing_units_are_skipped(self):
         self.enable_systemd()
