@@ -45,9 +45,19 @@ class ServiceTests(UtsFixture):
 
     def systemd_mocks(self):
         return r'''
+            stat() {
+              case "$2" in
+                %u) printf '0\n' ;;
+                %a) printf '700\n' ;;
+                *) return 1 ;;
+              esac
+            }
             command_exists() { [[ "$1" == systemctl ]]; }
             timeout() {
               local unit="${@: -1}"
+              if [[ "$*" == *" -p ExecStop "* || "$*" == *" -p ExecStopPre "* ]]; then
+                return 0
+              fi
               if [[ -L "$UTS_TEST_ROOT/etc/systemd/system/$unit" ]]; then
                 printf 'LoadState=masked\n'
               elif [[ -f "$UTS_TEST_ROOT/etc/systemd/system/$unit" ]]; then
@@ -234,6 +244,7 @@ class ServiceTests(UtsFixture):
                 *FragmentPath*) printf 'LoadState=not-found\nActiveState=inactive\nFragmentPath=\n' ;;
                 *"LoadState tat_agent.service") printf 'LoadState=masked\n' ;;
                 *LoadState*) printf 'LoadState=not-found\n' ;;
+                *ExecStop*) return 0 ;;
                 *) printf 'ActiveState=inactive\n' ;;
               esac
             }
@@ -277,3 +288,117 @@ class ServiceTests(UtsFixture):
                 else:
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(result.stderr, "")
+
+
+class StopHookTests(UtsFixture):
+    def setUp(self):
+        super().setUp()
+        self.units = self.root / "run/systemd/system"
+        self.units.mkdir(parents=True)
+
+    def hook_mocks(self, mode="clear"):
+        return f'''
+            MOCK_HOOK_MODE={mode}
+            command_exists() {{ [[ "$1" == systemctl ]]; }}
+            stat() {{
+              case "$2" in
+                %u) printf '0\\n' ;;
+                %a) printf '755\\n' ;;
+                *) return 1 ;;
+              esac
+            }}
+            timeout() {{
+              local unit="${{@: -1}}" first=ExecStop override="" ready=0
+              if [[ "$*" == *LoadState* ]]; then
+                case "$unit" in
+                  stargate.service|stargate.socket) printf 'LoadState=loaded\\n' ;;
+                  *) printf 'LoadState=not-found\\n' ;;
+                esac
+                return 0
+              fi
+              [[ "$*" == *ExecStopPre* ]] && first=ExecStopPre
+              if [[ "$MOCK_HOOK_MODE" == unreadable ]]; then return 1; fi
+              if [[ "$MOCK_HOOK_MODE" == empty ]]; then return 0; fi
+              if [[ "$MOCK_HOOK_MODE" == unexpected ]]; then printf 'Unexpected=value\\n'; return 0; fi
+              for override in "$UTS_TEST_ROOT/run/systemd/system/$unit.d"/zzzz-uts-*.conf; do
+                [[ ! -f "$override" ]] || ready=1
+              done
+              if [[ "$MOCK_HOOK_MODE" == clear && "$ready" -eq 1 && -f "$UTS_TEST_ROOT/tmp/reloaded" ]]; then
+                return 0
+              else
+                printf '%s=/vendor/stop.sh\\nExecStopPost=/vendor/post-stop.sh\\n' "$first"
+              fi
+            }}
+            run() {{
+              record "run $*"
+              if [[ "$*" == 'systemctl daemon-reload' ]]; then
+                [[ "$MOCK_HOOK_MODE" != reload_failure ]] || return 1
+                touch "$UTS_TEST_ROOT/tmp/reloaded"
+              fi
+              return 0
+            }}
+        '''
+
+    def test_empty_hook_response_requires_no_override(self):
+        for unit in ("stargate.service", "stargate.socket"):
+            with self.subTest(unit=unit):
+                result = self.run_shell(self.hook_mocks("empty") + f"prepare_service_stop {unit}")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text(), "")
+                self.assertFalse(list(self.units.glob("*.d")))
+
+    def test_service_and_socket_hooks_are_cleared_before_any_stop(self):
+        result = self.run_shell(self.hook_mocks() + "stop_services stargate")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for unit, expected in (
+            ("stargate.service", "[Service]\nExecStop=\nExecStopPost=\nRestart=no\n"),
+            ("stargate.socket", "[Socket]\nExecStopPre=\nExecStopPost=\n"),
+        ):
+            files = list((self.units / f"{unit}.d").glob("zzzz-uts-*.conf"))
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].read_text(), expected)
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            [
+                "run systemctl daemon-reload",
+                "run systemctl daemon-reload",
+                "run systemctl stop stargate.socket",
+                "run systemctl disable stargate.socket",
+                "run systemctl stop stargate.service",
+                "run systemctl disable stargate.service",
+            ],
+        )
+
+    def test_failed_hook_verification_preserves_override_without_stopping(self):
+        for mode in ("remain", "reload_failure"):
+            with self.subTest(mode=mode):
+                result = self.run_shell(self.hook_mocks(mode) + "stop_services stargate")
+                self.assert_failed(result)
+                self.assertEqual(self.events.read_text(), "run systemctl daemon-reload\n")
+                files = list((self.units / "stargate.service.d").glob("zzzz-uts-*.conf"))
+                self.assertTrue(files)
+                self.assertTrue(all("ExecStop=\nExecStopPost=\n" in path.read_text() for path in files))
+                for path in files:
+                    path.unlink()
+
+    def test_unreadable_or_unexpected_hook_response_refuses_stop(self):
+        for mode in ("unreadable", "unexpected"):
+            with self.subTest(mode=mode):
+                result = self.run_shell(self.hook_mocks(mode) + "stop_services stargate")
+                self.assert_failed(result)
+                self.assertIn("Cannot inspect stop hooks for stargate.service.", result.stderr)
+                self.assertEqual(self.events.read_text(), "")
+                self.assertFalse(list(self.units.glob("*.d")))
+
+    def test_dry_run_does_not_write_hook_overrides(self):
+        before = self.file_snapshot()
+        result = self.run_shell(
+            self.hook_mocks()
+            + self.real_function("run")
+            + "exec 3>&1\nDRY_RUN=1\nstop_services stargate"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Would suppress vendor stop hooks", result.stdout)
+        self.assertIn("[DRY-RUN] systemctl stop stargate.service", result.stdout)
+        self.assertEqual(self.events.read_text(), "")
+        self.assertEqual(before, self.file_snapshot())

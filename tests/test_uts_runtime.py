@@ -182,7 +182,7 @@ class InterruptTests(UtsFixture):
             )
             body += (
                 "remove_cron_lines /qcloud/YunJing/\n"
-                if query == "crontab" else "query systemctl show -p LoadState tat_agent.service\n"
+                if query == "crontab" else "prepare_service_stop tat_agent.service\n"
             )
         else:
             body += (

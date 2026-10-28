@@ -288,6 +288,16 @@ confirm() {
   esac
 }
 
+root_owned_private() {
+  local owner="" mode=""
+  [[ ! -L "$1" ]] || return 1
+  owner="$(stat -c '%u' "$1" 2>/dev/null)" || return 1
+  [[ "${owner}" == 0 ]] || return 1
+  mode="$(stat -c '%a' "$1" 2>/dev/null)" || return 1
+  [[ "${mode}" =~ ^[0-7]+$ ]] || return 1
+  (( (8#${mode} & 8#022) == 0 ))
+}
+
 run_local_script() {
   local script_path="$1" description="" header="" rc=0
   msg "official $2${script_path}" "官方卸载程序 $2${script_path}"
@@ -403,6 +413,54 @@ preserved_mask() {
   [[ -L "$1" && "$(readlink -- "$1")" == /dev/null ]]
 }
 
+unit_stop_hooks() {
+  local unit="$1" first="" state="" key="" value="" hooks=""
+  QUERY_OUTPUT=""
+  case "${unit##*.}" in
+    service) first=ExecStop ;;
+    socket) first=ExecStopPre ;;
+    *) return 0 ;;
+  esac
+  query systemctl show --all -p "${first}" -p ExecStopPost "${unit}" || return $?
+  state="${QUERY_OUTPUT}"
+  [[ -n "${state}" ]] || return 0
+  while IFS='=' read -r key value; do
+    [[ "${key}" == "${first}" || "${key}" == ExecStopPost ]] || return 1
+    [[ -z "${value}" ]] || hooks+="${key}=${value}"$'\n'
+  done <<<"${state}"
+  QUERY_OUTPUT="${hooks}"
+  return 0
+}
+
+prepare_service_stop() {
+  local unit="$1" hooks="" directory="/run/systemd/system/$1.d" override="" section_name="Service" first=ExecStop rc=0
+  unit_stop_hooks "${unit}" || { rc=$?; warn "Cannot inspect stop hooks for ${unit}." "无法检查 ${unit} 的停止钩子。"; return "${rc}"; }
+  hooks="${QUERY_OUTPUT}"
+  [[ -n "${hooks}" ]] || return 0
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "Would suppress vendor stop hooks for ${unit} before stopping it." "停止 ${unit} 前将屏蔽厂商停止钩子。"
+    return 0
+  fi
+  if ! path_present "${directory}"; then
+    mkdir -m 755 -- "${directory}" || return 1
+  fi
+  [[ -d "${directory}" ]] && root_owned_private "${directory}" || return 1
+  if [[ "${unit}" == *.socket ]]; then section_name=Socket; first=ExecStopPre; fi
+  override="$(mktemp "${directory}/zzzz-uts-XXXXXX.conf")" || return 1
+  {
+    printf '[%s]\n%s=\nExecStopPost=\n' "${section_name}" "${first}"
+    [[ "${section_name}" != Service ]] || printf 'Restart=no\n'
+  } >"${override}" || return 1
+  run systemctl daemon-reload || return $?
+  unit_stop_hooks "${unit}" || return $?
+  hooks="${QUERY_OUTPUT}"
+  if [[ -n "${hooks}" ]]; then
+    warn "Stop hooks remain enabled for ${unit}; no stop was requested." "${unit} 的停止钩子仍然有效，未请求停止。"
+    return 1
+  fi
+  log "Suppressed vendor stop hooks for ${unit}; cleanup will remove ${override}." "已屏蔽 ${unit} 的厂商停止钩子，清理时会删除 ${override}。"
+}
+
 upstart_stop_hooks() {
   local file="" rc=0
   for file in "/etc/init/$1.conf" "/etc/init/$1.override"; do
@@ -436,6 +494,16 @@ stop_services() {
       fi
     fi
   done
+  if systemd_available; then
+    for svc in "$@"; do
+      for suffix in service socket; do
+        query systemctl show -p LoadState "${svc}.${suffix}" || return $?
+        state="${QUERY_OUTPUT}"
+        [[ "${state}" != LoadState=not-found ]] || continue
+        prepare_service_stop "${svc}.${suffix}" || return $?
+      done
+    done
+  fi
   for svc in "$@"; do
     if systemd_available; then
       for suffix in socket timer service; do
