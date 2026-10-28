@@ -466,6 +466,38 @@ preflight_paths() {
   done < <(selected_dirs)
 }
 
+preflight_launcher() {
+  local pid="${PPID}" executable="" line="" svc="" depth=0 rc=0
+  local -a selected=() dirs=() services=()
+  while IFS= read -r line; do selected+=("${line}"); done < <(selected_dirs)
+  while IFS= read -r line; do dirs+=("${line}"); done < <(with_real_paths "${selected[@]}")
+  while IFS= read -r svc; do services+=("${svc}"); done < <(selected_services)
+  while [[ "${pid}" =~ ^[0-9]+$ && "${pid}" -gt 1 && "${depth}" -lt 64 ]]; do
+    executable="$(readlink -- "${PROC_ROOT}/${pid}/exe" 2>/dev/null)" || executable=""
+    if [[ -n "${executable}" ]] && is_agent_process "${PROC_ROOT}/${pid}" "${executable% (deleted)}" "${dirs[@]}"; then
+      warn "Parent process ${pid} belongs to a component selected for removal: ${executable}." "父进程 ${pid} 属于待卸载组件：${executable}。"
+      warn "Do not run this script through the Automation Tools console; use SSH instead." "不要通过自动化助手控制台运行本脚本，请改用 SSH。"
+      [[ "${DRY_RUN}" -eq 0 ]] || return 0
+      return 1
+    else
+      rc=$?
+      [[ "${rc}" -le 1 || "${DRY_RUN}" -eq 1 ]] || return 1
+    fi
+    pid="$(awk '{ sub(/^.*\) /, ""); print $2 }' "${PROC_ROOT}/${pid}/stat" 2>/dev/null)" || break
+    depth=$((depth + 1))
+  done
+  [[ -r "${PROC_ROOT}/self/cgroup" ]] || return 0
+  while IFS= read -r line; do
+    for svc in "${services[@]}"; do
+      if [[ "${line}/" == *"/${svc}.service/"* ]]; then
+        warn "This script runs inside ${svc}.service, which it would stop." "本脚本运行在将被停止的 ${svc}.service 中。"
+        [[ "${DRY_RUN}" -eq 0 ]] || return 0
+        return 1
+      fi
+    done
+  done <"${PROC_ROOT}/self/cgroup"
+}
+
 remove_path() {
   local path="$1" kind="${2:-file}"
   path_present "${path}" || return 0
@@ -1290,6 +1322,8 @@ main() {
   detect_distro
   prepare_runtime
   preflight_paths || die "Unsafe installation paths. No uninstall was attempted." "安装路径不安全，未执行任何卸载。"
+  preflight_launcher || die "Run from an SSH session or a detached unit such as systemd-run. No uninstall was attempted." \
+    "请在 SSH 会话或 systemd-run 等独立单元中运行，未执行任何卸载。"
   log "System: ${DISTRO_PRETTY}, $(uname -m)" "系统：${DISTRO_PRETTY}，$(uname -m)"
   confirm
 

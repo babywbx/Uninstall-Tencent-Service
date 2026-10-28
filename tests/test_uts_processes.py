@@ -338,3 +338,41 @@ class ProcessTests(UtsFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"[DRY-RUN] kill -TERM 900095 ({os.path.realpath(service)})", result.stdout)
         self.assertEqual(self.events.read_text(), "")
+
+
+class LauncherTests(UtsFixture):
+    def test_launcher_rejects_selected_agent_parent(self):
+        yunjing = self.root / "usr/local/qcloud/YunJing"
+        (yunjing / "startYD.sh").parent.mkdir(parents=True)
+        (yunjing / "startYD.sh").write_text("exit 0\n")
+        tat_agent = str(self.root / "usr/local/qcloud/tat_agent/tat_agent")
+        for parent, include_tat, dry_run, status in (
+            ("yunjing", 0, 0, 1),
+            ("yunjing", 0, 1, 0),
+            ("tat", 0, 0, 0),
+            ("tat", 1, 0, 1),
+            ("tat", 1, 1, 0),
+        ):
+            with self.subTest(parent=parent, include_tat=include_tat, dry_run=dry_run):
+                if parent == "yunjing":
+                    proc = self.process(os.getpid(), "/bin/bash", ["bash", "./startYD.sh"])
+                    (proc / "cwd").symlink_to(yunjing)
+                else:
+                    proc = self.process(os.getpid(), tat_agent, [tat_agent])
+                try:
+                    result = self.run_shell(f"INCLUDE_TAT={include_tat}\nDRY_RUN={dry_run}\npreflight_launcher")
+                finally:
+                    shutil.rmtree(proc)
+                self.assertEqual(result.returncode, status, result.stderr)
+                rejected = parent == "yunjing" or include_tat == 1
+                self.assertEqual("Parent process" in result.stderr, rejected)
+                self.assertEqual("Automation Tools console" in result.stderr, rejected)
+
+    def test_launcher_rejects_selected_service_cgroup(self):
+        self.enable_proc()
+        (self.root / "proc/self/cgroup").write_text("0::/system.slice/tat_agent.service\n")
+        for include, dry_run, status in ((0, 0, 0), (1, 0, 1), (1, 1, 0)):
+            with self.subTest(include=include, dry_run=dry_run):
+                result = self.run_shell(f"INCLUDE_TAT={include}\nDRY_RUN={dry_run}\npreflight_launcher")
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual("runs inside tat_agent.service" in result.stderr, include == 1)
