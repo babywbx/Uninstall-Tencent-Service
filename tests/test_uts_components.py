@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 import shutil
 import sys
 
@@ -138,6 +139,7 @@ class YunjingTests(UtsFixture):
             ("unknown format", b"MZ\x90\x00 not a shell script\n", 1, "Unrecognized uninstaller format", False),
             ("not executable", None, 1, "Empty or non-executable uninstaller", False),
             ("empty", b"", 1, "Empty or non-executable uninstaller", False),
+            ("symlink", None, 1, "Missing or symlinked uninstaller", False),
             ("broken binary", ELF, None, "Command failed (", True),
             ("exit 7", b"#!/bin/bash\nexit 7\n", 7, "Command failed (7)", True),
             ("exit 124", b"#!/bin/bash\nexit 124\n", 124, "Command failed (124)", True),
@@ -147,7 +149,10 @@ class YunjingTests(UtsFixture):
             with self.subTest(case=name):
                 self.reset()
                 script = self.primary / "uninst.sh"
-                if name == "not executable":
+                if name == "symlink":
+                    self.primary.mkdir(parents=True)
+                    script.symlink_to(self.vendor_script(self.base / "target.sh", self.logging_script("target")))
+                elif name == "not executable":
                     self.vendor_script(script, self.logging_script("not-executable")).chmod(0o644)
                 else:
                     self.vendor_script(script, payload)
@@ -165,7 +170,55 @@ class YunjingTests(UtsFixture):
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertIn("Local cleanup was not started.", result.stderr)
                 self.assertEqual(self.events.read_text().splitlines(), official)
-                self.assertTrue(script.is_file())
+                self.assertTrue(script.is_symlink() or script.is_file())
+
+    def test_untrusted_official_uninstaller_is_skipped_for_local_cleanup(self):
+        script = self.vendor_script(self.primary / "uninst.sh", self.logging_script("untrusted"))
+        for untrusted, field, value in (
+            (script, "%u", "501"),
+            (script, "%a", "666"),
+            (self.primary, "%u", "1000"),
+            (self.primary, "%a", "775"),
+        ):
+            with self.subTest(path=untrusted.name, field=field):
+                result = self.run_shell(
+                    self.local_stubs
+                    + EXECUTE
+                    + self.real_function("run")
+                    + f"""
+                    stat() {{
+                      if [[ "${{@: -1}}" == {shlex.quote(str(untrusted))} && "$2" == {field} ]]; then
+                        printf '{value}\\n'
+                        return 0
+                      fi
+                      case "$2" in
+                        %u) printf '0\\n' ;;
+                        %a) printf '755\\n' ;;
+                        *) return 1 ;;
+                      esac
+                    }}
+                    uninstall_yunjing
+                    """
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(self.vendor_log.exists())
+                self.assertIn(f"Skipping official {script}: {untrusted} is not a root-owned", result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
+
+    def test_skipped_untrusted_uninstaller_does_not_block_running_agent_cleanup(self):
+        self.vendor_script(self.primary / "uninst.sh", self.logging_script("untrusted"))
+        agent = str(self.primary / "YDEyes/YDService")
+        self.process(4242, agent, [agent])
+        result = self.run_shell(
+            self.local_stubs
+            + EXECUTE
+            + self.real_function("run")
+            + ROOT_STAT.replace("755", "666")
+            + "uninstall_yunjing\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.vendor_log.exists())
+        self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
 
     def test_missing_uninstaller_still_cleans_dirs_and_cron_lines(self):
         self.primary.mkdir(parents=True)
@@ -308,6 +361,32 @@ class MonitorTests(UtsFixture):
                 ])
                 self.assertFalse(monitor.exists())
                 self.assertFalse(stargate.exists())
+
+    def test_non_root_owned_vendor_tree_is_cleaned_locally(self):
+        stargate = self.root / "usr/local/qcloud/stargate"
+        self.vendor_script(stargate / "admin/uninstall.sh", self.logging_script("sgagent"))
+        result = self.run_shell(
+            self.real_function("preflight_paths")
+            + EXECUTE
+            + r"""
+            stat() { printf '501\n'; }
+            root_crontab() { :; }
+            stop_services() { :; }
+            run() {
+              record "run $*"
+              case "$1" in rm|rmdir) command "$@" ;; esac
+            }
+            INCLUDE_MONITOR=1
+            preflight_paths || exit 97
+            uninstall_monitor
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(stargate.exists())
+        self.assertFalse(self.vendor_log.exists())
+        self.assertIn("not owned by root", result.stderr)
+        self.assertIn(f"Skipping official Sgagent {stargate}/admin/uninstall.sh", result.stderr)
+        self.assertEqual(self.events.read_text(), f"run rm -rf -- {stargate}\n")
 
     def test_monitor_directory_with_other_content_is_kept_without_failure(self):
         for other in ("other/agent.conf", ".cache"):

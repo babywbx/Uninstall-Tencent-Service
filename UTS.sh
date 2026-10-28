@@ -299,9 +299,23 @@ root_owned_private() {
 }
 
 run_local_script() {
-  local script_path="$1" description="" header="" rc=0
+  local script_path="$1" root_dir="$3" description="" dir="" header="" rc=0
   msg "official $2${script_path}" "官方卸载程序 $2${script_path}"
   description="${MSG}"
+  if [[ -L "${script_path}" || ! -f "${script_path}" ]]; then
+    warn "Missing or symlinked uninstaller: ${description}." "卸载程序缺失或为符号链接：${description}。"
+    return 1
+  fi
+  dir="${script_path}"
+  while :; do
+    if ! root_owned_private "${dir}"; then
+      warn "Skipping ${description}: ${dir} is not a root-owned, root-writable-only path; cleaning up locally instead." \
+        "跳过${description}：${dir} 不属于 root 或可被其他用户写入，改为本地清理。"
+      return 0
+    fi
+    [[ "${dir}" != "${root_dir}" && "${dir}" == "${root_dir}/"* ]] || break
+    dir="${dir%/*}"
+  done
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     preview "would run ${description}" "将运行${description}"
     return 0
@@ -1106,7 +1120,7 @@ uninstall_yunjing() {
   for dir in "${YUNJING_DIRS[@]}"; do
     path_present "${dir}/uninst.sh" || continue
     ran=1
-    run_local_script "${dir}/uninst.sh" "" || official_rc=$?
+    run_local_script "${dir}/uninst.sh" "" "${dir}" || official_rc=$?
     break
   done
   [[ "${ran}" -eq 1 ]] || log "No official uninst.sh found; cleaning local remnants only." "未找到官方 uninst.sh，仅清理本地残留。"
@@ -1140,12 +1154,12 @@ uninstall_monitor() {
   for dir in "${MONITOR_DIRS[@]}"; do
     path="${dir}/barad/admin/uninstall.sh"
     path_present "${path}" || continue
-    run_local_script "${path}" "BaradAgent " || return $?
+    run_local_script "${path}" "BaradAgent " "${dir}/barad" || return $?
   done
   for dir in "${STARGATE_DIRS[@]}"; do
     path="${dir}/admin/uninstall.sh"
     path_present "${path}" || continue
-    run_local_script "${path}" "Sgagent " || return $?
+    run_local_script "${path}" "Sgagent " "${dir}" || return $?
   done
   remove_cron_lines /qcloud/stargate/ /qcloud/monitor/barad/ || return $?
   remove_system_cron_lines /etc/cron.d/sgagenttask /qcloud/stargate/ || return $?
