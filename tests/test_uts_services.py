@@ -156,7 +156,7 @@ class ServiceTests(UtsFixture):
             ["run systemctl daemon-reload", "run systemctl reset-failed tat_agent.service"],
         )
 
-    def test_preexisting_mask_is_left_alone(self):
+    def test_preexisting_mask_is_left_alone_and_passes_verification(self):
         self.enable_systemd()
         self.unit.symlink_to("/dev/null")
         result = self.run_shell(
@@ -165,6 +165,9 @@ class ServiceTests(UtsFixture):
             command_exists() { [[ "$1" == systemctl ]]; }
             timeout() {
               case "$*" in
+                *"FragmentPath tat_agent.service")
+                  printf 'LoadState=masked\nActiveState=inactive\nFragmentPath=/dev/null\n' ;;
+                *FragmentPath*) printf 'LoadState=not-found\nActiveState=inactive\nFragmentPath=\n' ;;
                 *"LoadState tat_agent.service") printf 'LoadState=masked\n' ;;
                 *LoadState*) printf 'LoadState=not-found\n' ;;
                 *) printf 'ActiveState=inactive\n' ;;
@@ -172,6 +175,7 @@ class ServiceTests(UtsFixture):
             }
             stop_services tat_agent
             cleanup_services tat_agent
+            verify_services tat_agent
             '''
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -180,3 +184,32 @@ class ServiceTests(UtsFixture):
             ["run systemctl stop tat_agent.service", "run systemctl daemon-reload"],
         )
         self.assertEqual(os.readlink(self.unit), "/dev/null")
+
+    def test_verify_services_passes_only_when_units_are_gone(self):
+        self.enable_systemd()
+        gone = "LoadState=not-found\\nActiveState=inactive\\nFragmentPath=\\n"
+        remaining = f"LoadState=loaded\\nActiveState=active\\nFragmentPath={self.unit}\\n"
+        self.unit.symlink_to("/dev/null")
+        for case, state, warning in (
+            ("gone", gone, None),
+            ("remaining", remaining, f"Service remains or cannot be verified: tat_agent.service (loaded, active, {self.unit})."),
+        ):
+            with self.subTest(case=case):
+                result = self.run_shell(
+                    f'''
+                    command_exists() {{ [[ "$1" == systemctl ]]; }}
+                    timeout() {{
+                      case "${{@: -1}}" in
+                        tat_agent.service) printf '{state}' ;;
+                        *) printf '{gone}' ;;
+                      esac
+                    }}
+                    verify_services tat_agent tat_agent_service tat_install
+                    '''
+                )
+                if warning:
+                    self.assert_failed(result)
+                    self.assertIn(warning, result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr, "")

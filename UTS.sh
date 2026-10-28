@@ -459,6 +459,39 @@ cleanup_services() {
   return "${rc}"
 }
 
+verify_services() {
+  systemd_available || return 0
+  local svc="" suffix="" state="" key="" value="" load="" active="" fragment="" root="" preserved=0 rc=0
+  for svc in "$@"; do
+    for suffix in service timer socket; do
+      query systemctl show -p LoadState -p ActiveState -p FragmentPath "${svc}.${suffix}" || return $?
+      state="${QUERY_OUTPUT}"
+      load=""; active=""; fragment=""
+      while IFS='=' read -r key value; do
+        case "${key}" in
+          LoadState) load="${value}" ;;
+          ActiveState) active="${value}" ;;
+          FragmentPath) fragment="${value}" ;;
+        esac
+      done <<<"${state}"
+      preserved=0
+      if [[ "${load}" == masked && "${active}" == inactive ]]; then
+        for root in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+          if preserved_mask "${root}/${svc}.${suffix}"; then
+            preserved=1
+          fi
+        done
+      fi
+      [[ "${preserved}" -eq 0 ]] || continue
+      if [[ "${load}" != not-found || -n "${fragment}" || "${active}" != inactive && "${active}" != failed ]]; then
+        warn "Service remains or cannot be verified: ${svc}.${suffix} (${load}, ${active}, ${fragment})." "服务仍在或无法验证：${svc}.${suffix}（${load}，${active}，${fragment}）。"
+        rc=1
+      fi
+    done
+  done
+  return "${rc}"
+}
+
 path_in_dirs() {
   local executable="$1" dir=""
   shift
@@ -978,6 +1011,7 @@ verify_uninstall() {
     printf '%s\n' "${files}" >&2
     found=1
   fi
+  verify_services "${services[@]}" || found=1
   cron_remnants "${patterns[@]}" || found=1
   while IFS= read -r path; do
     [[ -n "${path}" ]] || continue

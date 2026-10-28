@@ -635,7 +635,7 @@ class VerifyTests(UtsFixture):
         )
 
     def test_clean_root_passes_verification(self):
-        result = self.run_shell(self.verify("agent_processes() { :; }"))
+        result = self.run_shell(self.verify("agent_processes() { :; }\nverify_services() { return 0; }"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.events.read_text(), "")
