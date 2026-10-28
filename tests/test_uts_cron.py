@@ -24,7 +24,7 @@ OTHER_LINES = (
     "  0  4  *  *  * \t/opt/tool/run.sh   --flag  ",
 )
 MIXED_LISTING = "\n".join((*OTHER_LINES[:2], SGAGENT_LINE, *OTHER_LINES[2:])) + "\n"
-MONITOR_PATTERNS = "/qcloud/stargate/ /qcloud/monitor/barad/"
+MONITOR_PATTERNS = "/qcloud/stargate/ /qcloud/monitor/barad/ /qcloud/monitor/python26/"
 COMPOUND_COMMANDS = (
     "/usr/local/qcloud/YunJing/YDCrontab.sh && /opt/backup.sh",
     "/opt/backup.sh && /usr/local/qcloud/YunJing/YDCrontab.sh",

@@ -18,7 +18,8 @@ YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
 YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup)
 STARGATE_DIRS=(/usr/local/qcloud/stargate /var/lib/qcloud/stargate)
 MONITOR_DIRS=(/usr/local/qcloud/monitor /var/lib/qcloud/monitor)
-MONITOR_FILES=(/tmp/stargate.lock /var/run/stargate.tencentyun.pid /var/run/stargat.tencentyun.pid)
+MONITOR_FILES=(/tmp/stargate.lock /usr/bin/cagent_tools /opt/bin/cagent_tools /var/run/stargate.tencentyun.pid
+  /var/run/stargat.tencentyun.pid /var/run/.barad_agent.pid /var/run/barad_agent.lock)
 YUNJING_SERVICES=(YDService YDLive)
 MONITOR_SERVICES=(stargate)
 
@@ -335,7 +336,7 @@ monitor_targets() {
   local dir=""
   printf '%s\n' "${STARGATE_DIRS[@]}"
   for dir in "${MONITOR_DIRS[@]}"; do
-    printf '%s\n' "${dir}/barad"
+    printf '%s\n' "${dir}/barad" "${dir}/barad.STARGATE" "${dir}/python26" "${dir}/config"
   done
 }
 
@@ -356,7 +357,7 @@ selected_services() {
 selected_cron_patterns() {
   printf '%s\n' /qcloud/YunJing/
   if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
-    printf '%s\n' /qcloud/stargate/ /qcloud/monitor/barad/
+    printf '%s\n' /qcloud/stargate/ /qcloud/monitor/barad/ /qcloud/monitor/python26/
   fi
 }
 
@@ -967,7 +968,7 @@ cron_agent_line() {
   executable="${BASH_REMATCH[1]}"
   [[ "${executable}" == /* ]] || return 1
   executable="$(resolved_path "${executable}")" || return 1
-  for directory in "${MONITOR_DIRS[@]}"; do directories+=("${directory}/barad"); done
+  for directory in "${MONITOR_DIRS[@]}"; do directories+=("${directory}/barad" "${directory}/python26"); done
   for pattern in "$@"; do
     for prefix in usr/local var/lib; do
       [[ "${executable}" != "/${prefix}${pattern}"* ]] || return 0
@@ -1161,7 +1162,7 @@ uninstall_monitor() {
     path_present "${path}" || continue
     run_local_script "${path}" "Sgagent " "${dir}" || return $?
   done
-  remove_cron_lines /qcloud/stargate/ /qcloud/monitor/barad/ || return $?
+  remove_cron_lines /qcloud/stargate/ /qcloud/monitor/barad/ /qcloud/monitor/python26/ || return $?
   remove_system_cron_lines /etc/cron.d/sgagenttask /qcloud/stargate/ || return $?
   if systemd_available; then
     run systemctl daemon-reload || return $?

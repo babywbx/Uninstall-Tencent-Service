@@ -37,6 +37,16 @@ class ProcessTests(UtsFixture):
         self.assertIn(f"900011|{real}|", result.stdout)
         self.assertNotIn("(deleted)", result.stdout)
 
+    def test_bundled_python_running_barad_plugin_is_matched(self):
+        python = str(self.monitor / "python26/bin/python")
+        plugin = f"{self.monitor}/barad/plugin/report.py"
+        self.process(900015, python, ["python", plugin])
+        self.process(900016, "/usr/bin/python3", ["python3", plugin])
+        result = self.run_shell(self.selected_scan())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"900015|{os.path.realpath(python)}|", result.stdout)
+        self.assertNotIn("900016|", result.stdout)
+
     def test_shell_wrappers_match_only_scripts_inside_selected_dirs(self):
         inside = (
             ("/bin/sh", ["sh", f"{self.stargate}/admin/start.sh"]),
@@ -270,7 +280,7 @@ class ProcessTests(UtsFixture):
         self.process(900030, str(self.stargate / "bin/sgagent"), ["sgagent", "-d"])
         fallback = shlex.quote(f"{real_root}/var/lib/qcloud/YunJing")
         result = self.run_shell(
-            f'with_real_paths "${{STARGATE_DIRS[0]}}" "${{MONITOR_DIRS[0]}}/barad" {fallback}\n'
+            f'with_real_paths "${{STARGATE_DIRS[0]}}" "${{MONITOR_DIRS[0]}}/python26" {fallback}\n'
             'agent_processes "${STARGATE_DIRS[@]}"\n'
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -278,8 +288,8 @@ class ProcessTests(UtsFixture):
         self.assertEqual(lines[:5], [
             str(self.stargate),
             f"{real_root}/data/qcloud/stargate",
-            f"{self.monitor}/barad",
-            f"{real_root}/data/qcloud/monitor/barad",
+            f"{self.monitor}/python26",
+            f"{real_root}/data/qcloud/monitor/python26",
             f"{real_root}/var/lib/qcloud/YunJing",
         ])
         self.assertEqual(len(lines), 6)

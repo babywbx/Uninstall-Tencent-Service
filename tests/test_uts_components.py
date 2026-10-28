@@ -33,8 +33,11 @@ LATER_STEPS = r"""
 def install_monitor(root, prefix, scripts=True):
     monitor = root / prefix / "monitor"
     stargate = root / prefix / "stargate"
-    for directory in (monitor / "barad/admin", stargate / "admin", stargate / "bin"):
+    for directory in (monitor / "barad/admin", monitor / "python26/bin", stargate / "admin", stargate / "bin"):
         directory.mkdir(parents=True, exist_ok=True)
+    (monitor / "python26/bin/python").touch()
+    (monitor / "config").mkdir(exist_ok=True)
+    (monitor / "config/proc_conf.ini").write_text("[process]\nproclist = \n")
     (stargate / "bin/sgagent64").touch()
     if scripts:
         for script in (monitor / "barad/admin/uninstall.sh", stargate / "admin/uninstall.sh"):
@@ -287,13 +290,19 @@ class MonitorTests(UtsFixture):
             for name in (
                 "etc/cron.d/sgagenttask",
                 "tmp/stargate.lock",
+                "usr/bin/cagent_tools",
+                "opt/bin/cagent_tools",
                 "var/run/stargate.tencentyun.pid",
                 "var/run/stargat.tencentyun.pid",
             )
         ]
         for path in paths:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("x\n")
+            if path.name == "cagent_tools":
+                path.unlink(missing_ok=True)
+                path.symlink_to("/usr/local/qcloud/monitor/barad/client/cagent_tools.py")
+            else:
+                path.write_text("x\n")
         paths[0].write_text("* * * * * root /usr/local/qcloud/stargate/admin/start.sh\n")
         return paths
 
@@ -357,6 +366,8 @@ class MonitorTests(UtsFixture):
                     self.official(stargate / "admin/uninstall.sh"),
                     f"run rm -rf -- {stargate}",
                     f"run rm -rf -- {monitor}/barad",
+                    f"run rm -rf -- {monitor}/python26",
+                    f"run rm -rf -- {monitor}/config",
                     f"run rmdir -- {monitor}",
                 ])
                 self.assertFalse(monitor.exists())
@@ -388,6 +399,23 @@ class MonitorTests(UtsFixture):
         self.assertIn(f"Skipping official Sgagent {stargate}/admin/uninstall.sh", result.stderr)
         self.assertEqual(self.events.read_text(), f"run rm -rf -- {stargate}\n")
 
+    def test_stale_barad_copy_and_config_are_removed_with_the_monitor_root(self):
+        monitor, stargate = install_monitor(self.root, "usr/local/qcloud", scripts=False)
+        stale = monitor / "barad.STARGATE/client"
+        stale.mkdir(parents=True)
+        (stale / "cagent_tools.py").write_text("# stale copy\n")
+        result = self.run_shell(MOCKS + "uninstall_monitor")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text().splitlines(), [
+            f"run rm -rf -- {stargate}",
+            f"run rm -rf -- {monitor}/barad",
+            f"run rm -rf -- {monitor}/barad.STARGATE",
+            f"run rm -rf -- {monitor}/python26",
+            f"run rm -rf -- {monitor}/config",
+            f"run rmdir -- {monitor}",
+        ])
+        self.assertFalse(monitor.exists())
+
     def test_monitor_directory_with_other_content_is_kept_without_failure(self):
         for other in ("other/agent.conf", ".cache"):
             with self.subTest(other=other):
@@ -401,6 +429,7 @@ class MonitorTests(UtsFixture):
                 self.assertNotIn("[WARN]", result.stderr)
                 events = self.events.read_text()
                 self.assertIn(f"run rm -rf -- {monitor}/barad\n", events)
+                self.assertIn(f"run rm -rf -- {monitor}/python26\n", events)
                 self.assertNotIn("rmdir", events)
                 self.assertEqual([path.name for path in monitor.iterdir()], [other.split("/")[0]])
                 self.assertEqual(keep.read_text(), "keep\n")
@@ -433,7 +462,13 @@ class MonitorTests(UtsFixture):
                 "usr/local/qcloud/stargate",
                 "var/lib/qcloud/stargate",
                 "usr/local/qcloud/monitor/barad",
+                "usr/local/qcloud/monitor/barad.STARGATE",
+                "usr/local/qcloud/monitor/python26",
+                "usr/local/qcloud/monitor/config",
                 "var/lib/qcloud/monitor/barad",
+                "var/lib/qcloud/monitor/barad.STARGATE",
+                "var/lib/qcloud/monitor/python26",
+                "var/lib/qcloud/monitor/config",
             )
         )
         events = self.events.read_text().splitlines()
@@ -519,6 +554,7 @@ class MonitorTests(UtsFixture):
         self.assertEqual(len(sweep), 1)
         self.assertNotIn(f" {monitor} ", sweep[0] + " ")
         self.assertIn(f"{monitor}/barad", sweep[0])
+        self.assertIn(f"{monitor}/python26", sweep[0])
 
 
 class ComponentTests(UtsFixture):
@@ -594,7 +630,13 @@ class ComponentTests(UtsFixture):
             self.root / "usr/local/qcloud/stargate",
             self.root / "var/lib/qcloud/stargate",
             self.root / "usr/local/qcloud/monitor/barad",
+            self.root / "usr/local/qcloud/monitor/barad.STARGATE",
+            self.root / "usr/local/qcloud/monitor/python26",
+            self.root / "usr/local/qcloud/monitor/config",
             self.root / "var/lib/qcloud/monitor/barad",
+            self.root / "var/lib/qcloud/monitor/barad.STARGATE",
+            self.root / "var/lib/qcloud/monitor/python26",
+            self.root / "var/lib/qcloud/monitor/config",
         ]
         yunjing_leftovers = [
             self.root / "tmp/yunjing_install",
@@ -602,8 +644,12 @@ class ComponentTests(UtsFixture):
         ]
         monitor_leftovers = [
             self.root / "tmp/stargate.lock",
+            self.root / "usr/bin/cagent_tools",
+            self.root / "opt/bin/cagent_tools",
             self.root / "var/run/stargate.tencentyun.pid",
             self.root / "var/run/stargat.tencentyun.pid",
+            self.root / "var/run/.barad_agent.pid",
+            self.root / "var/run/barad_agent.lock",
         ]
         for monitor in (0, 1):
             with self.subTest(monitor=monitor):
@@ -622,7 +668,7 @@ class ComponentTests(UtsFixture):
                 self.assertEqual(
                     patterns,
                     ["/qcloud/YunJing/"]
-                    + ["/qcloud/stargate/", "/qcloud/monitor/barad/"] * monitor,
+                    + ["/qcloud/stargate/", "/qcloud/monitor/barad/", "/qcloud/monitor/python26/"] * monitor,
                 )
                 self.assertEqual(
                     leftovers,
