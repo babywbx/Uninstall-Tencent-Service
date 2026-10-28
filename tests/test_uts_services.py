@@ -70,7 +70,7 @@ class ServiceTests(UtsFixture):
 
     def test_service_files_lists_tat_units_and_nothing_for_absent_ones(self):
         files = self.tat_files()
-        result = self.run_shell('service_files tat_agent tat_agent_service tat_install')
+        result = self.run_shell('service_files "${TAT_SERVICES[@]}"')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertCountEqual(result.stdout.splitlines(), [str(path) for path in files])
         result = self.run_shell("service_files stargate tat_install")
@@ -87,7 +87,7 @@ class ServiceTests(UtsFixture):
             with self.subTest(tools=tools):
                 result = self.run_shell(
                     f'command_exists() {{ [[ " {tools} " == *" $1 "* ]]; }}\n'
-                    'stop_services tat_agent tat_agent_service tat_install\n'
+                    'stop_services "${TAT_SERVICES[@]}"\n'
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.events.read_text().splitlines(), [f"run {deregister}"])
@@ -161,7 +161,7 @@ class ServiceTests(UtsFixture):
                 elif override_kind:
                     override.write_text(override_kind)
                 before = self.file_snapshot()
-                for services in ("tat_agent tat_agent_service tat_install", "stargate tat_agent_service"):
+                for services in ("${TAT_SERVICES[@]}", "stargate tat_agent_service"):
                     result = self.run_shell(
                         'command_exists() { [[ "$1" == initctl || "$1" == update-rc.d ]]; }\n'
                         f"stop_services {services}\n"
@@ -187,7 +187,7 @@ class ServiceTests(UtsFixture):
                     f"  [[ -n {shlex.quote(state)} ]] || return 1\n"
                     f"  printf '%s\\n' {shlex.quote(state)}\n"
                     "}\n"
-                    'stop_services tat_agent tat_agent_service tat_install\n'
+                    'stop_services "${TAT_SERVICES[@]}"\n'
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.events.read_text().splitlines(), expected)
@@ -196,7 +196,7 @@ class ServiceTests(UtsFixture):
     def test_loaded_unit_is_stopped_and_disabled_while_missing_units_are_skipped(self):
         self.enable_systemd()
         self.unit.write_text("[Service]\n")
-        result = self.run_shell(self.systemd_mocks() + 'stop_services tat_agent tat_agent_service tat_install')
+        result = self.run_shell(self.systemd_mocks() + 'stop_services "${TAT_SERVICES[@]}"')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
             self.events.read_text().splitlines(),
@@ -219,7 +219,7 @@ class ServiceTests(UtsFixture):
                 *) printf 'ActiveState=inactive\n' ;;
               esac
             }
-            cleanup_services tat_agent tat_agent_service tat_install
+            cleanup_services "${TAT_SERVICES[@]}"
             '''
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -279,7 +279,7 @@ class ServiceTests(UtsFixture):
                         *) printf '{gone}' ;;
                       esac
                     }}
-                    verify_services tat_agent tat_agent_service tat_install
+                    verify_services "${{TAT_SERVICES[@]}}"
                     '''
                 )
                 if warning:

@@ -15,6 +15,7 @@ SGAGENTTASK_LINE = (
 )
 YUNJING_LINE = "0 0 * * * /usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1 &"
 BARAD_LINE = "*/5 * * * * /usr/local/qcloud/monitor/barad/admin/trystart.sh"
+TAT_LINE = "* * * * * /usr/local/qcloud/tat_agent/install/init_install.sh"
 OTHER_COMPONENT_LINE = "*/5 * * * * /usr/local/qcloud/monitor/other/agent.sh"
 OTHER_LINES = (
     "SHELL=/bin/bash",
@@ -168,11 +169,12 @@ class RootCrontabTests(UtsFixture):
 
     def test_removal_is_scoped_to_component_patterns(self):
         decoy = "0 1 * * * /home/admin/YDCrontab.sh"
-        lines = (YUNJING_LINE, SGAGENT_LINE, BARAD_LINE, OTHER_COMPONENT_LINE, decoy)
+        lines = (YUNJING_LINE, SGAGENT_LINE, BARAD_LINE, TAT_LINE, OTHER_COMPONENT_LINE, decoy)
         self.listing.write_text("\n".join(lines) + "\n")
         for patterns, removed in (
             ("/qcloud/YunJing/", (YUNJING_LINE,)),
             (MONITOR_PATTERNS, (SGAGENT_LINE, BARAD_LINE)),
+            ("/qcloud/tat_agent/", (TAT_LINE,)),
         ):
             with self.subTest(patterns=patterns):
                 result = self.run_shell(self.crontab_mocks() + f"remove_cron_lines {patterns}")
@@ -382,7 +384,7 @@ class CronRemnantTests(UtsFixture):
 
     def selected(self, command):
         return (
-            "INCLUDE_MONITOR=1\npatterns=()\n"
+            "INCLUDE_MONITOR=1\nINCLUDE_TAT=1\npatterns=()\n"
             'while IFS= read -r pattern; do patterns+=("$pattern"); done < <(selected_cron_patterns)\n'
             f'{command} "${{patterns[@]}}"\n'
         )

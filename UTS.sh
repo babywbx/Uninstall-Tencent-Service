@@ -20,11 +20,16 @@ STARGATE_DIRS=(/usr/local/qcloud/stargate /var/lib/qcloud/stargate)
 MONITOR_DIRS=(/usr/local/qcloud/monitor /var/lib/qcloud/monitor)
 MONITOR_FILES=(/tmp/stargate.lock /usr/bin/cagent_tools /opt/bin/cagent_tools /var/run/stargate.tencentyun.pid
   /var/run/stargat.tencentyun.pid /var/run/.barad_agent.pid /var/run/barad_agent.lock)
+TAT_DIRS=(/usr/local/qcloud/tat_agent /var/lib/qcloud/tat_agent)
+TAT_FILES=(/usr/local/bin/tat_agent /usr/sbin/tat_agent /opt/bin/tat_agent /var/run/tat_agent.pid)
+TAT_WORKDIR="/tmp/tat_agent"
 YUNJING_SERVICES=(YDService YDLive)
 MONITOR_SERVICES=(stargate)
+TAT_SERVICES=(tat_agent tat_agent_service tat_install)
 
 AUTO_YES=0
 INCLUDE_MONITOR=0
+INCLUDE_TAT=0
 DRY_RUN=0
 UI_LANG=zh
 MSG=""
@@ -72,6 +77,7 @@ ${SCRIPT_NAME} ${VERSION}
 选项：
   -y, --yes                跳过确认提示（没有终端时必须使用）
       --include-monitor    同时卸载云监控（BaradAgent 和 Sgagent）
+      --include-tat        同时卸载腾讯云自动化助手（tat_agent）
       --dry-run            只预览将要停止和删除的内容，不做任何修改
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
   -h, --help               显示本帮助
@@ -98,6 +104,7 @@ Usage: ./UTS.sh [options]
 Options:
   -y, --yes                Skip the confirmation prompt (required without a terminal)
       --include-monitor    Also uninstall Cloud Monitor (BaradAgent and Sgagent)
+      --include-tat        Also uninstall TencentCloud Automation Tools (tat_agent)
       --dry-run            Show what would be stopped or removed, change nothing
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
   -h, --help               Show this help message
@@ -244,6 +251,7 @@ parse_args() {
     case "$1" in
       -y|--yes) AUTO_YES=1 ;;
       --include-monitor) INCLUDE_MONITOR=1 ;;
+      --include-tat) INCLUDE_TAT=1 ;;
       --dry-run) DRY_RUN=1 ;;
       --timeout)
         [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,3}$ && "$2" -le 3600 ]] \
@@ -266,6 +274,7 @@ component_name() {
   case "$1" in
     yunjing) msg "Host Security agent (YunJing)" "主机安全 Agent（YunJing）" ;;
     monitor) msg "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）" ;;
+    tat) msg "TencentCloud Automation Tools (tat_agent)" "腾讯云自动化助手（tat_agent）" ;;
   esac
 }
 
@@ -273,6 +282,7 @@ component_selected() {
   case "$1" in
     yunjing) return 0 ;;
     monitor) [[ "${INCLUDE_MONITOR}" -eq 1 ]] ;;
+    tat) [[ "${INCLUDE_TAT}" -eq 1 ]] ;;
   esac
 }
 
@@ -345,12 +355,18 @@ selected_dirs() {
   if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
     monitor_targets
   fi
+  if [[ "${INCLUDE_TAT}" -eq 1 ]]; then
+    printf '%s\n' "${TAT_DIRS[@]}"
+  fi
 }
 
 selected_services() {
   printf '%s\n' "${YUNJING_SERVICES[@]}"
   if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
     printf '%s\n' "${MONITOR_SERVICES[@]}"
+  fi
+  if [[ "${INCLUDE_TAT}" -eq 1 ]]; then
+    printf '%s\n' "${TAT_SERVICES[@]}"
   fi
 }
 
@@ -359,12 +375,18 @@ selected_cron_patterns() {
   if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
     printf '%s\n' /qcloud/stargate/ /qcloud/monitor/barad/ /qcloud/monitor/python26/
   fi
+  if [[ "${INCLUDE_TAT}" -eq 1 ]]; then
+    printf '%s\n' /qcloud/tat_agent/
+  fi
 }
 
 selected_leftovers() {
   printf '%s\n' "${YUNJING_FILES[@]}"
   if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
     printf '%s\n' "${MONITOR_FILES[@]}"
+  fi
+  if [[ "${INCLUDE_TAT}" -eq 1 ]]; then
+    printf '%s\n' "${TAT_FILES[@]}"
   fi
 }
 
@@ -900,7 +922,7 @@ cron_agent_line() {
   local comment_re='^[[:space:]]+(#.*)?$'
   local shell_re='^((/(usr/)?bin/)?(sh|bash|dash))[[:space:]]+(--[[:space:]]+)?(.+)$'
   local executable_re="^['\"]?([^[:space:]'\";&|]+)['\"]?([[:space:]].*)?$"
-  local -a directories=("${YUNJING_DIRS[@]}" "${STARGATE_DIRS[@]}")
+  local -a directories=("${YUNJING_DIRS[@]}" "${STARGATE_DIRS[@]}" "${TAT_DIRS[@]}")
   shift 2
   if [[ "${line}" =~ ${macro_re} ]]; then
     command="${BASH_REMATCH[2]}"
@@ -1178,6 +1200,26 @@ uninstall_monitor() {
   return "${rc}"
 }
 
+uninstall_tat() {
+  [[ "${INCLUDE_TAT}" -eq 1 ]] || return 0
+  section "TencentCloud Automation Tools (tat_agent)" "腾讯云自动化助手（tat_agent）"
+  local dir="" path="" rc=0
+  remove_cron_lines /qcloud/tat_agent/ || return $?
+  stop_services "${TAT_SERVICES[@]}" || return $?
+  stop_agent_processes "${TAT_DIRS[@]}" || return 1
+  cleanup_services "${TAT_SERVICES[@]}" || return $?
+  remove_paths tree "${TAT_DIRS[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  if [[ -d "${TAT_WORKDIR}" && ! -L "${TAT_WORKDIR}" ]]; then
+    if root_owned_private "${TAT_WORKDIR}"; then
+      remove_path "${TAT_WORKDIR}" tree || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+    else
+      warn "Keeping ${TAT_WORKDIR}: it is not a root-owned, root-writable-only directory." "保留 ${TAT_WORKDIR}：该目录不属于 root 或可被其他用户写入。"
+    fi
+  fi
+  remove_paths file "${TAT_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  return "${rc}"
+}
+
 verify_uninstall() {
   local path="" svc="" targets="" files="" found=0
   local -a dirs=() services=() patterns=()
@@ -1239,7 +1281,7 @@ exit_status() {
 }
 
 main() {
-  local verify_rc=0 rc=0 yunjing_rc=0
+  local component="" verify_rc=0 rc=0 yunjing_rc=0
 
   exec 3>&1
   parse_args "$@"
@@ -1261,17 +1303,21 @@ main() {
     exit_status "${yunjing_rc}"
   fi
 
-  if component_selected monitor; then
-    uninstall_monitor || rc=$?
-    if [[ "${rc}" -ne 0 ]]; then
-      component_name monitor
-      record_failure "${MSG} uninstall is incomplete (${rc})." "${MSG}卸载未完成（${rc}）。"
-      if stop_on "${rc}"; then
-        finish 1
-        return "${rc}"
-      fi
+  for component in monitor tat; do
+    component_selected "${component}" || continue
+    rc=0
+    case "${component}" in
+      monitor) uninstall_monitor || rc=$? ;;
+      tat) uninstall_tat || rc=$? ;;
+    esac
+    [[ "${rc}" -ne 0 ]] || continue
+    component_name "${component}"
+    record_failure "${MSG} uninstall is incomplete (${rc})." "${MSG}卸载未完成（${rc}）。"
+    if stop_on "${rc}"; then
+      finish 1
+      return "${rc}"
     fi
-  fi
+  done
 
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     section "Verification" "验证"

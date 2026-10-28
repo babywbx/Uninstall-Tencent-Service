@@ -71,6 +71,7 @@ class FileSafetyTests(UtsFixture):
     def test_file_only_paths_never_remove_directories_recursively(self):
         for relative, command in (
             ("var/run/tat_agent.pid", 'remove_path "$UTS_TEST_ROOT/var/run/tat_agent.pid"'),
+            ("usr/local/bin/tat_agent", "uninstall_tat"),
             ("tmp/stargate.lock", "uninstall_monitor"),
         ):
             with self.subTest(path=relative):
@@ -81,6 +82,7 @@ class FileSafetyTests(UtsFixture):
                 result = self.run_shell(
                     RUN_REAL
                     + r'''
+                    INCLUDE_TAT=1
                     INCLUDE_MONITOR=1
                     root_crontab() { :; }
                     stop_services() { :; }

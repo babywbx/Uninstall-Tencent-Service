@@ -7,6 +7,7 @@ import sys
 from test_uts import EXECUTE, ROOT_STAT, UtsFixture
 
 
+TAT_SERVICES = "tat_agent tat_agent_service tat_install"
 ELF = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 56
 MOCKS = r"""
     stat() { printf '0\n'; }
@@ -44,6 +45,29 @@ def install_monitor(root, prefix, scripts=True):
             script.write_text("#!/bin/bash\nexit 0\n")
             script.chmod(0o755)
     return monitor, stargate
+
+
+def tat_paths(root):
+    directories = [root / "usr/local/qcloud/tat_agent", root / "var/lib/qcloud/tat_agent"]
+    leftovers = [
+        root / "usr/local/bin/tat_agent",
+        root / "usr/sbin/tat_agent",
+        root / "opt/bin/tat_agent",
+        root / "var/run/tat_agent.pid",
+    ]
+    return directories, leftovers
+
+
+def install_tat(root):
+    directories, leftovers = tat_paths(root)
+    for directory in directories:
+        directory.mkdir(parents=True)
+        (directory / "tat_agent").write_bytes(b"ELF")
+    for link in leftovers[:3]:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(directories[0] / "tat_agent")
+    leftovers[3].write_text("4242\n")
+    return directories, leftovers
 
 
 class YunjingTests(UtsFixture):
@@ -129,12 +153,13 @@ class YunjingTests(UtsFixture):
             self.local_stubs + ROOT_STAT + EXECUTE + self.real_function("run")
             + r"""
             uninstall_monitor() { record monitor; }
+            uninstall_tat() { record tat; }
             verify_uninstall() { record verify; }
-            main --yes --include-monitor
+            main --yes --include-monitor --include-tat
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.events.read_text().splitlines()[-2:], ["monitor", "verify"])
+        self.assertEqual(self.events.read_text().splitlines()[-3:], ["monitor", "tat", "verify"])
         self.assertIn("local uninstall verified", result.stdout)
 
     def test_official_uninstaller_failure_stops_local_cleanup(self):
@@ -557,15 +582,158 @@ class MonitorTests(UtsFixture):
         self.assertIn(f"{monitor}/python26", sweep[0])
 
 
+class TatTests(UtsFixture):
+    def setUp(self):
+        super().setUp()
+        self.tat_dirs, self.leftovers = tat_paths(self.root)
+
+    def install_service_files(self):
+        unit = self.root / "etc/systemd/system/tat_agent.service"
+        wants = unit.parent / "multi-user.target.wants/tat_agent.service"
+        init_script = self.root / "etc/init.d/tat_agent_service"
+        upstart = self.root / "etc/init/tat_agent_service.conf"
+        wants.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=/usr/local/qcloud/tat_agent/tat_agent\n")
+        wants.symlink_to(unit)
+        init_script.parent.mkdir()
+        init_script.write_text("#!/bin/bash\n")
+        upstart.parent.mkdir()
+        upstart.write_text("respawn\n")
+        return [unit, wants, init_script, upstart]
+
+    def test_selected_tat_stops_services_and_processes_then_removes_files(self):
+        install_tat(self.root)
+        files = self.install_service_files()
+        for pid, directory in zip((900001, 900002), self.tat_dirs):
+            binary = str(directory / "tat_agent")
+            self.process(pid, binary, [binary])
+        self.enable_proc()
+        result = self.run_shell(
+            r"""
+            stat() { printf '0\n'; }
+            root_crontab() { :; }
+            stop_services() { record "stop-services $*"; }
+            kill() { record "kill $*"; mv "${UTS_TEST_ROOT}/proc/$2" "${UTS_TEST_ROOT}/tmp/exited-$2"; }
+            run() { record "run $*"; [[ "$1" != rm ]] || command "$@"; }
+            INCLUDE_TAT=1
+            uninstall_tat
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("==> TencentCloud Automation Tools (tat_agent)", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            [
+                f"stop-services {TAT_SERVICES}",
+                "kill -TERM 900001",
+                "kill -TERM 900002",
+                "sleep 1",
+                *(f"run rm -f -- {path}" for path in files),
+                *(f"run rm -rf -- {path}" for path in self.tat_dirs),
+                *(f"run rm -f -- {path}" for path in self.leftovers),
+            ],
+        )
+        for path in (*self.tat_dirs, *files, *self.leftovers):
+            self.assertFalse(path.exists() or path.is_symlink(), path)
+
+    def test_failed_leftover_removal_fails_tat(self):
+        install_tat(self.root)
+        self.enable_proc()
+        result = self.run_shell(
+            r"""
+            stat() { printf '0\n'; }
+            root_crontab() { :; }
+            stop_services() { :; }
+            stop_agent_processes() { :; }
+            cleanup_services() { :; }
+            run() {
+              record "run $*"
+              [[ "$*" != *tat_agent.pid ]] || return 1
+              [[ "$1" != rm ]] || command "$@"
+            }
+            INCLUDE_TAT=1
+            uninstall_tat
+            """
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            [
+                *(f"run rm -rf -- {path}" for path in self.tat_dirs),
+                *(f"run rm -f -- {path}" for path in self.leftovers),
+            ],
+        )
+        self.assertTrue(self.leftovers[3].exists())
+        for path in (*self.tat_dirs, *self.leftovers[:3]):
+            self.assertFalse(path.exists() or path.is_symlink(), path)
+
+    def test_tat_self_update_workdir_is_removed_only_when_root_owned(self):
+        workdir = self.root / "tmp/tat_agent/self_update/agent_update_unzip"
+        for owner, mode, removed in (("0", "755", True), ("1000", "755", False), ("0", "777", False)):
+            with self.subTest(owner=owner, mode=mode):
+                workdir.mkdir(parents=True, exist_ok=True)
+                (workdir / "tat_agent").write_bytes(b"ELF")
+                self.enable_proc()
+                result = self.run_shell(
+                    f"""
+                    stat() {{
+                      case "$2" in
+                        %u) printf '{owner}\\n' ;;
+                        %a) printf '{mode}\\n' ;;
+                        *) return 1 ;;
+                      esac
+                    }}
+                    root_crontab() {{ :; }}
+                    stop_services() {{ :; }}
+                    stop_agent_processes() {{ :; }}
+                    cleanup_services() {{ :; }}
+                    run() {{ record "run $*"; [[ "$1" != rm ]] || command "$@"; }}
+                    INCLUDE_TAT=1
+                    uninstall_tat
+                    """
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                tree = self.root / "tmp/tat_agent"
+                self.assertEqual(self.events.read_text(), f"run rm -rf -- {tree}\n" if removed else "")
+                self.assertEqual(tree.exists(), not removed)
+                self.assertEqual("Keeping" in result.stderr, not removed)
+
+    def test_tat_cron_is_removed_before_stopping_and_other_jobs_are_kept(self):
+        result = self.run_shell(
+            r'''
+            WORKDIR="$UTS_TEST_ROOT/tmp"
+            INCLUDE_TAT=1
+            root_crontab() {
+              QUERY_OUTPUT="$(
+              printf '%s\n' '* * * * * /usr/local/qcloud/tat_agent/install/init_install.sh'
+              printf '%s\n' '0 3 * * * /usr/local/bin/backup.sh'
+              )"
+            }
+            stop_services() { record stop; }
+            stop_agent_processes() { :; }
+            cleanup_services() { :; }
+            uninstall_tat
+            '''
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        written = self.root / "tmp/crontab"
+        self.assertEqual(written.read_text(), "0 3 * * * /usr/local/bin/backup.sh\n")
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            [f"run crontab -u root {written}", "stop"],
+        )
+
+
 class ComponentTests(UtsFixture):
     def test_timeout_stops_component_cleanup_before_later_steps(self):
         self.enable_proc()
-        for component in ("yunjing", "monitor"):
+        for component in ("yunjing", "monitor", "tat"):
             for failing in ("remove_cron_lines", "cleanup_services", "remove_paths"):
                 for status in (124, 137, 143):
                     with self.subTest(component=component, failing=failing, status=status):
                         result = self.run_shell(
-                            "INCLUDE_MONITOR=1\n"
+                            "INCLUDE_MONITOR=1\nINCLUDE_TAT=1\n"
                             + "remove_cron_lines() { :; }\nremove_system_cron_lines() { :; }\n"
                             + "stop_services() { :; }\nstop_agent_processes() { :; }\n"
                             + "cleanup_services() { :; }\nremove_paths() { record remove; }\n"
@@ -577,37 +745,43 @@ class ComponentTests(UtsFixture):
 
     def test_optional_components_are_untouched_unless_selected(self):
         install_monitor(self.root, "usr/local/qcloud")
+        install_tat(self.root)
         (self.root / "etc/cron.d").mkdir()
         (self.root / "etc/cron.d/sgagenttask").write_text("* * * * * root /usr/local/qcloud/stargate/admin/start.sh\n")
         before = self.file_snapshot()
-        result = self.run_shell(
-            r"""
-            remove_cron_lines() { record cron; }
-            stop_services() { record "stop-services $*"; }
-            stop_agent_processes() { record "stop-processes $*"; }
-            cleanup_services() { record "cleanup-services $*"; }
-            uninstall_monitor
-            """
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout + result.stderr, "")
-        self.assertEqual(self.events.read_text(), "")
-        self.assertEqual(before, self.file_snapshot())
+        for component in ("monitor", "tat"):
+            with self.subTest(component=component):
+                result = self.run_shell(
+                    r"""
+                    remove_cron_lines() { record cron; }
+                    stop_services() { record "stop-services $*"; }
+                    stop_agent_processes() { record "stop-processes $*"; }
+                    cleanup_services() { record "cleanup-services $*"; }
+                    """
+                    + f"uninstall_{component}\n"
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout + result.stderr, "")
+                self.assertEqual(self.events.read_text(), "")
+                self.assertEqual(before, self.file_snapshot())
 
     def test_cron_failure_stops_component_before_services(self):
         yunjing = self.root / "usr/local/qcloud/YunJing"
         yunjing.mkdir(parents=True)
         install_monitor(self.root, "usr/local/qcloud", scripts=False)
+        install_tat(self.root)
         before = self.file_snapshot()
         for component, functions in (
             ("yunjing", ("remove_cron_lines", "remove_system_cron_lines")),
             ("monitor", ("remove_cron_lines", "remove_system_cron_lines")),
+            ("tat", ("remove_cron_lines",)),
         ):
             for function in functions:
                 with self.subTest(component=component, function=function):
                     result = self.run_shell(
                         r"""
                         INCLUDE_MONITOR=1
+                        INCLUDE_TAT=1
                         root_crontab() { :; }
                         stop_services() { record stop; }
                         stop_agent_processes() { record processes; }
@@ -620,6 +794,7 @@ class ComponentTests(UtsFixture):
                     self.assertEqual(before, self.file_snapshot())
 
     def test_selection_helpers_follow_component_flags(self):
+        tat_dirs, tat_leftovers = tat_paths(self.root)
         yunjing_dirs = [
             self.root / "usr/local/qcloud/YunJing",
             self.root / "var/lib/qcloud/YunJing",
@@ -652,25 +827,33 @@ class ComponentTests(UtsFixture):
             self.root / "var/run/barad_agent.lock",
         ]
         for monitor in (0, 1):
-            with self.subTest(monitor=monitor):
-                result = self.run_shell(
-                    f"INCLUDE_MONITOR={monitor}\n"
-                    "selected_dirs; echo ---; selected_services; echo ---; "
-                    "selected_cron_patterns; echo ---; selected_leftovers"
-                )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(result.stderr, "")
-                dirs, services, patterns, leftovers = (
-                    part.splitlines() for part in result.stdout.split("---\n")
-                )
-                self.assertEqual(dirs, [str(path) for path in yunjing_dirs + monitor_dirs * monitor])
-                self.assertEqual(services, ["YDService", "YDLive"] + ["stargate"] * monitor)
-                self.assertEqual(
-                    patterns,
-                    ["/qcloud/YunJing/"]
-                    + ["/qcloud/stargate/", "/qcloud/monitor/barad/", "/qcloud/monitor/python26/"] * monitor,
-                )
-                self.assertEqual(
-                    leftovers,
-                    [str(path) for path in yunjing_leftovers + monitor_leftovers * monitor],
-                )
+            for tat in (0, 1):
+                with self.subTest(monitor=monitor, tat=tat):
+                    result = self.run_shell(
+                        f"INCLUDE_MONITOR={monitor}\nINCLUDE_TAT={tat}\n"
+                        "selected_dirs; echo ---; selected_services; echo ---; "
+                        "selected_cron_patterns; echo ---; selected_leftovers"
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    dirs, services, patterns, leftovers = (
+                        part.splitlines() for part in result.stdout.split("---\n")
+                    )
+                    self.assertEqual(
+                        dirs,
+                        [str(path) for path in yunjing_dirs + monitor_dirs * monitor + tat_dirs * tat],
+                    )
+                    self.assertEqual(
+                        services,
+                        ["YDService", "YDLive"] + ["stargate"] * monitor + TAT_SERVICES.split() * tat,
+                    )
+                    self.assertEqual(
+                        patterns,
+                        ["/qcloud/YunJing/"]
+                        + ["/qcloud/stargate/", "/qcloud/monitor/barad/", "/qcloud/monitor/python26/"] * monitor
+                        + ["/qcloud/tat_agent/"] * tat,
+                    )
+                    self.assertEqual(
+                        leftovers,
+                        [str(path) for path in yunjing_leftovers + monitor_leftovers * monitor + tat_leftovers * tat],
+                    )

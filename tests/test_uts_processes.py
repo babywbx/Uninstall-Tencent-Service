@@ -11,6 +11,7 @@ class ProcessTests(UtsFixture):
         self.yunjing = self.root / "usr/local/qcloud/YunJing"
         self.stargate = self.root / "usr/local/qcloud/stargate"
         self.monitor = self.root / "usr/local/qcloud/monitor"
+        self.tat = self.root / "usr/local/qcloud/tat_agent"
         self.yunjing.mkdir(parents=True)
         (self.stargate / "bin").mkdir(parents=True)
         (self.monitor / "barad/admin").mkdir(parents=True)
@@ -22,7 +23,7 @@ class ProcessTests(UtsFixture):
 
     def selected_scan(self):
         return (
-            "INCLUDE_MONITOR=1\ndirs=()\n"
+            "INCLUDE_MONITOR=1\nINCLUDE_TAT=1\ndirs=()\n"
             'while IFS= read -r dir; do dirs+=("${dir}"); done < <(selected_dirs)\n'
             'agent_processes "${dirs[@]}"\n'
         )
@@ -53,6 +54,7 @@ class ProcessTests(UtsFixture):
             ("/bin/bash", ["bash", f"{self.monitor}/barad/admin/trystart.sh"]),
             ("/bin/sh", ["sh", "-e", f"{self.yunjing}/startYD.sh"]),
             ("/bin/dash", ["dash", "-eu", "--", f"{self.yunjing}/stopYDCore.sh"]),
+            ("/bin/bash", ["/bin/bash", f"{self.tat}/install/init_install.sh", "-service"]),
         )
         outside = (
             ("/bin/sh", ["sh", f"{self.root}/opt/other/admin/start.sh"]),
@@ -278,9 +280,9 @@ class ProcessTests(UtsFixture):
         real = self.sgagent()
         self.assertTrue(real.startswith(f"{real_root}/data/qcloud/stargate/"))
         self.process(900030, str(self.stargate / "bin/sgagent"), ["sgagent", "-d"])
-        fallback = shlex.quote(f"{real_root}/var/lib/qcloud/YunJing")
+        tat = shlex.quote(f"{real_root}/var/lib/qcloud/tat_agent")
         result = self.run_shell(
-            f'with_real_paths "${{STARGATE_DIRS[0]}}" "${{MONITOR_DIRS[0]}}/python26" {fallback}\n'
+            f'with_real_paths "${{STARGATE_DIRS[0]}}" "${{MONITOR_DIRS[0]}}/python26" {tat}\n'
             'agent_processes "${STARGATE_DIRS[@]}"\n'
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -290,7 +292,7 @@ class ProcessTests(UtsFixture):
             f"{real_root}/data/qcloud/stargate",
             f"{self.monitor}/python26",
             f"{real_root}/data/qcloud/monitor/python26",
-            f"{real_root}/var/lib/qcloud/YunJing",
+            f"{real_root}/var/lib/qcloud/tat_agent",
         ])
         self.assertEqual(len(lines), 6)
         self.assertTrue(lines[5].startswith(f"900030|{real}|"), lines[5])
