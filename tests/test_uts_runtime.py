@@ -31,6 +31,7 @@ class RuntimeTests(UtsFixture):
     def test_lock_rejects_inheriting_instance_and_releases_on_exit(self):
         proc = self.root / "proc/self"
         proc.mkdir()
+        (proc / "mountinfo").touch()
         (proc / "status").touch()
         stat_override = r'''
             stat() {

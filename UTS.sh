@@ -202,7 +202,7 @@ prepare_runtime() {
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
   timeout -k 1 1 true 2>/dev/null || die "GNU timeout with -k is required. Install coreutils." "需要支持 -k 的 GNU timeout，请安装 coreutils。"
-  [[ -r "${PROC_ROOT}/self/status" ]] || die "A readable Linux /proc is required." "需要可读的 Linux /proc。"
+  [[ -r "${PROC_ROOT}/self/mountinfo" && -r "${PROC_ROOT}/self/status" ]] || die "A readable Linux /proc is required." "需要可读的 Linux /proc。"
   [[ "${DRY_RUN}" -eq 0 ]] || return 0
   [[ -d /run ]] || LOCK_DIR="/var/run/uts.lock"
   if [[ ! -e "${LOCK_DIR}" && ! -L "${LOCK_DIR}" ]]; then
@@ -357,14 +357,88 @@ path_present() {
   [[ -e "$1" || -L "$1" ]]
 }
 
+mount_records() {
+  UTS_MOUNT_ROOT="$1" awk '
+    function decode(value, result, code) {
+      result=""
+      while (match(value, /\\(040|011|012|134)/)) {
+        code=substr(value, RSTART + 1, 3)
+        result=result substr(value, 1, RSTART - 1)
+        if (code == "040") result=result " "
+        else if (code == "011") result=result "\t"
+        else if (code == "012") result=result "\n"
+        else result=result sprintf("%c", 92)
+        value=substr(value, RSTART + 4)
+      }
+      return result value
+    }
+    NF < 10 { invalid=1; next }
+    {
+      target=decode($5)
+      root=ENVIRON["UTS_MOUNT_ROOT"]
+      if (target == root || index(target, root "/") == 1) print
+    }
+    END { if (invalid) exit 1 }
+  ' "${PROC_ROOT}/self/mountinfo"
+}
+
+safe_parents() {
+  local parent="${1%/*}" target=""
+  while [[ -n "${parent}" && "${parent}" != / ]]; do
+    if [[ -L "${parent}" ]]; then
+      target="$(readlink -f -- "${parent}")" || return 1
+      if [[ ! ( "${parent}" == /var/run && "${target}" == /run ) \
+        && ! ( "${parent}" == /lib && "${target}" == /usr/lib ) \
+        && ! ( "${parent}" == /lib64 && "${target}" == /usr/lib64 ) \
+        && ! ( "${parent}" == /etc/init.d && "${target}" == /etc/rc.d/init.d ) \
+        && ! ( "${parent}" == /etc/rc[0-6S].d && "${target}" == "/etc/rc.d/${parent##*/}" ) ]]; then
+        warn "Refusing symlinked parent directory: ${parent}." "拒绝处理符号链接父目录：${parent}。"
+        return 1
+      fi
+    fi
+    parent="${parent%/*}"
+  done
+}
+
+safe_tree() {
+  local path="$1" resolved="" records=""
+  path_present "${path}" || return 0
+  safe_parents "${path}" || return 1
+  if [[ -L "${path}" || ! -d "${path}" ]]; then
+    warn "Refusing symlinked or non-directory installation path: ${path}." "拒绝处理符号链接或非目录的安装路径：${path}。"
+    return 1
+  fi
+  resolved="$(readlink -f -- "${path}")" || return 1
+  if [[ "$(stat -c '%u' "${path}")" != 0 ]]; then
+    warn "Installation directory is not owned by root: ${path}." "安装目录不属于 root：${path}。"
+  fi
+  records="$(mount_records "${resolved}")" || {
+    warn "Cannot inspect mount table for ${path}." "无法检查 ${path} 的挂载信息。"
+    return 1
+  }
+  [[ -z "${records}" ]] || {
+    warn "Mounted subtree: ${path}. Review mounts before uninstalling." "${path} 下有挂载点，请先检查挂载再卸载。"
+    return 1
+  }
+}
+
+preflight_paths() {
+  local path=""
+  while IFS= read -r path; do
+    safe_tree "${path}" || return 1
+  done < <(selected_dirs)
+}
+
 remove_path() {
   local path="$1" kind="${2:-file}"
   path_present "${path}" || return 0
+  safe_parents "${path}" || return 1
   if [[ -d "${path}" && ! -L "${path}" ]]; then
     if [[ "${kind}" != tree ]]; then
       warn "Refusing directory at a file-only cleanup path: ${path}." "此清理路径只应是文件，拒绝删除目录：${path}。"
       return 1
     fi
+    safe_tree "${path}" || return 1
     run rm -rf -- "${path}" || return $?
   else
     run rm -f -- "${path}" || return $?
@@ -378,6 +452,7 @@ remove_path() {
 remove_empty_dir() {
   local path="$1" entries=""
   [[ -d "${path}" && ! -L "${path}" ]] || return 0
+  safe_parents "${path}" || return 1
   entries="$(find "${path}" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -n 1)" || return 0
   [[ -z "${entries}" ]] || return 0
   run rmdir -- "${path}" || return $?
@@ -441,6 +516,7 @@ prepare_service_stop() {
     log "Would suppress vendor stop hooks for ${unit} before stopping it." "停止 ${unit} 前将屏蔽厂商停止钩子。"
     return 0
   fi
+  safe_parents "${directory}" || return 1
   if ! path_present "${directory}"; then
     mkdir -m 755 -- "${directory}" || return 1
   fi
@@ -939,6 +1015,7 @@ remove_system_cron_lines() {
     warn "Refusing non-regular system cron file: ${path}." "拒绝处理非普通文件的系统定时任务：${path}。"
     return 1
   fi
+  safe_parents "${path}" || return 1
   current="$(cat -- "${path}")" || return 1
   while IFS= read -r line; do
     if cron_agent_line "${line}" 1 "$@"; then
@@ -1155,6 +1232,7 @@ main() {
   require_root
   detect_distro
   prepare_runtime
+  preflight_paths || die "Unsafe installation paths. No uninstall was attempted." "安装路径不安全，未执行任何卸载。"
   log "System: ${DISTRO_PRETTY}, $(uname -m)" "系统：${DISTRO_PRETTY}，$(uname -m)"
   confirm
 

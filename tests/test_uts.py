@@ -72,6 +72,7 @@ class UtsFixture(unittest.TestCase):
     def enable_proc(self):
         (self.root / "proc/self").mkdir(exist_ok=True)
         (self.root / "proc/self/status").touch()
+        (self.root / "proc/self/mountinfo").touch()
 
     def process(self, pid, executable, arguments, started=100):
         proc = self.root / f"proc/{pid}"
@@ -137,6 +138,7 @@ class UtsFixture(unittest.TestCase):
             cleanup() { :; }
             require_root() { :; }
             prepare_runtime() { :; }
+            preflight_paths() { :; }
             run() { record "run $*"; return 0; }
         """
         return (
@@ -509,6 +511,15 @@ class MainTests(UtsFixture):
         self.assertEqual(self.terminal, b"")
         os.write(current["stdin"], b"current prompt")
         self.assertEqual(self.terminal_text("current prompt"), "current prompt")
+
+    def test_preflight_failure_stops_before_the_prompt(self):
+        result = self.run_shell(
+            self.STUBBED_MAIN + "preflight_paths() { return 1; }\nmain\n", **self.answer("y")
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+        self.assertIn("Unsafe installation paths. No uninstall was attempted.", result.stderr)
+        self.assertNotIn("Continue?", result.stdout)
 
     def test_dry_run_with_a_failed_step_is_not_reported_as_finished(self):
         result = self.run_shell(
