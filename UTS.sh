@@ -89,7 +89,7 @@ ${SCRIPT_NAME} ${VERSION}
       --dry-run            只预览将要停止和删除的内容，不做任何修改
       --force              出错后继续清理：官方卸载程序失败时仍做本地清理，对已确认的
                            Agent 进程使用 SIGKILL，屏蔽服务单元（原定义备份到
-                           /var/backups）
+                           /var/backups），并修复阻止删除的文件属性
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
   -h, --help               显示本帮助
 
@@ -119,7 +119,8 @@ Options:
       --dry-run            Show what would be stopped or removed, change nothing
       --force              Keep cleaning after failures: clean locally when an official
                            uninstaller fails, SIGKILL verified agent processes, mask
-                           service units (definitions backed up to /var/backups)
+                           service units (definitions backed up to /var/backups) and
+                           repair blocking file attributes
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
   -h, --help               Show this help message
 
@@ -525,7 +526,7 @@ preflight_launcher() {
 }
 
 remove_path() {
-  local path="$1" kind="${2:-file}"
+  local path="$1" kind="${2:-file}" rc=0 repair_rc=0
   path_present "${path}" || return 0
   safe_parents "${path}" || return 1
   if [[ -d "${path}" && ! -L "${path}" ]]; then
@@ -534,9 +535,25 @@ remove_path() {
       return 1
     fi
     safe_tree "${path}" || return 1
-    run rm -rf -- "${path}" || return $?
+    run rm -rf -- "${path}" || rc=$?
   else
-    run rm -f -- "${path}" || return $?
+    run rm -f -- "${path}" || rc=$?
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
+    if [[ "${FORCE}" -eq 0 || "${DRY_RUN}" -eq 1 || "${rc}" -eq 124 || "${rc}" -ge 128 ]]; then
+      return "${rc}"
+    fi
+    clear_blocking_attributes "${path}" || repair_rc=$?
+    stop_on "${repair_rc}" && return "${repair_rc}"
+    [[ "${repair_rc}" -eq 0 ]] || return "${rc}"
+    if [[ -d "${path}" && ! -L "${path}" ]]; then
+      [[ "${kind}" == tree ]] || return 1
+      safe_tree "${path}" || return 1
+      run rm -rf -- "${path}" || return $?
+    else
+      [[ ! -L "${path}" ]] || return 1
+      run rm -f -- "${path}" || return $?
+    fi
   fi
   if [[ "${DRY_RUN}" -eq 0 ]] && path_present "${path}"; then
     warn "Path still exists: ${path}." "路径仍然存在：${path}。"
@@ -551,6 +568,80 @@ remove_empty_dir() {
   entries="$(find "${path}" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -n 1)" || return 0
   [[ -z "${entries}" ]] || return 0
   run rmdir -- "${path}" || return $?
+}
+
+attribute_scope() {
+  local path="$1" candidate="" svc=""
+  local -a services=()
+  while IFS= read -r candidate; do
+    [[ "${path}" != "${candidate}" && "${path}" != "${candidate}/"* ]] || return 0
+  done < <(selected_dirs; selected_leftovers)
+  while IFS= read -r svc; do services+=("${svc}"); done < <(selected_services)
+  while IFS= read -r candidate; do
+    if [[ "${path}" == "${candidate}" || "${candidate}" == *.d && "${path}" == "${candidate}/"* ]]; then
+      return 0
+    fi
+  done < <(service_files "${services[@]}")
+  return 1
+}
+
+clear_blocking_attributes() {
+  local path="$1" listing="" root="" item="" actual="" attributes="" flags="" mounts="" changed=0 rc=0
+  [[ "${FORCE}" -eq 1 && "${DRY_RUN}" -eq 0 && ! -L "${path}" ]] || return 1
+  attribute_scope "${path}" || { warn "Attribute repair is outside the selected component scope: ${path}." "属性修复超出所选组件范围：${path}。"; return 1; }
+  if ! command_exists lsattr || ! command_exists chattr; then
+    warn "lsattr and chattr are needed to repair blocking file attributes." "修复阻止删除的文件属性需要 lsattr 和 chattr。"
+    return 1
+  fi
+  root="$(readlink -f -- "${path}")" || return 1
+  if [[ "$(stat -c '%u' "${path}")" != 0 ]]; then
+    warn "Attribute repair requires a root-owned path: ${path}." "属性修复要求路径属于 root：${path}。"
+    return 1
+  fi
+  if [[ -d "${path}" ]]; then
+    safe_tree "${path}" || return 1
+  elif [[ ! -f "${path}" ]]; then
+    return 1
+  else
+    mounts="$(mount_records "${root}")" || return 1
+    if [[ -n "${mounts}" ]]; then
+      warn "Refusing attribute changes on a mounted file: ${path}." "拒绝修改挂载文件的属性：${path}。"
+      return 1
+    fi
+  fi
+  listing="$(mktemp "${WORKDIR:-/tmp}/uts-attrs.XXXXXX")" || return 1
+  if [[ -d "${path}" ]]; then
+    run find "${path}" \( -type f -o -type d \) -print0 >"${listing}" || rc=$?
+  else
+    printf '%s\0' "${path}" >"${listing}"
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
+    rm -f -- "${listing}"
+    return "${rc}"
+  fi
+  while IFS= read -r -d '' item; do
+    [[ ! -L "${item}" && ( -f "${item}" || -d "${item}" ) ]] || continue
+    actual="$(readlink -f -- "${item}")" || { rc=1; break; }
+    if [[ "${actual}" != "${root}" && "${actual}" != "${root}/"* ]]; then
+      warn "Path changed during attribute repair: ${item}." "属性修复期间路径发生变化：${item}。"
+      rc=1; break
+    fi
+    query lsattr -d -- "${item}" || { rc=$?; break; }
+    attributes="${QUERY_OUTPUT}"
+    flags="${attributes%%[[:space:]]*}"
+    [[ "${flags}" =~ ^[a-zA-Z-]+$ ]] || { warn "Invalid file attribute response for ${item}." "${item} 的文件属性输出无效。"; rc=1; break; }
+    [[ "${flags}" == *i* || "${flags}" == *a* ]] || continue
+    if [[ -f "${item}" && "$(stat -c '%h' "${item}")" != 1 ]]; then
+      warn "Refusing attribute changes on a multiply linked file: ${item}." "拒绝修改多重硬链接文件的属性：${item}。"
+      rc=1; break
+    fi
+    log "Clearing immutable/append-only attributes on ${item}." "正在清除 ${item} 的 immutable 和 append-only 属性。"
+    run chattr -ia -- "${item}" || { rc=$?; break; }
+    changed=1
+  done <"${listing}"
+  rm -f -- "${listing}"
+  [[ "${rc}" -eq 0 ]] || return "${rc}"
+  [[ "${changed}" -eq 1 ]]
 }
 
 service_files() {
@@ -673,6 +764,10 @@ mask_selected_service() {
   fi
   mask_state_add "${path}" || { warn "Cannot record mask ownership in ${MASK_STATE}." "无法在 ${MASK_STATE} 中记录屏蔽归属。"; return 1; }
   run ln -sfn -- /dev/null "${path}" || rc=$?
+  if [[ "${rc}" -ne 0 && "${rc}" -ne 124 && "${rc}" -lt 128 ]] && clear_blocking_attributes "${path}"; then
+    rc=0
+    run ln -sfn -- /dev/null "${path}" || rc=$?
+  fi
   if [[ "${rc}" -ne 0 ]]; then
     mask_state_remove "${path}" || warn "Cannot update ${MASK_STATE}." "无法更新 ${MASK_STATE}。"
     return "${rc}"

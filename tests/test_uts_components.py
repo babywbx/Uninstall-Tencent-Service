@@ -940,6 +940,19 @@ class TatTests(UtsFixture):
 
 
 class ComponentTests(UtsFixture):
+    def test_attribute_repair_timeout_is_not_hidden_by_initial_removal_failure(self):
+        leftover = self.root / "var/run/YDService.pid"
+        leftover.write_text("4242\n")
+        for status in (124, 137, 143):
+            with self.subTest(status=status):
+                result = self.run_shell(
+                    "FORCE=1\nrun() { record remove; return 1; }\n"
+                    + f"clear_blocking_attributes() {{ record repair; return {status}; }}\n"
+                    + f"remove_path {shlex.quote(str(leftover))}\n"
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), ["remove", "repair"])
+
     def test_timeout_stops_component_cleanup_before_later_steps(self):
         self.enable_proc()
         for component in ("yunjing", "monitor", "tat"):

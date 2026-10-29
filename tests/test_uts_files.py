@@ -1,3 +1,4 @@
+import os
 import shlex
 
 from test_uts import UtsFixture
@@ -174,3 +175,87 @@ class FileSafetyTests(UtsFixture):
         self.assertTrue((busy / "data").is_dir())
         self.assertFalse(monitor.exists())
 
+    def attribute_mocks(self, links=1):
+        return f'''
+            WORKDIR="$UTS_TEST_ROOT/tmp"
+            FORCE=1
+            stat() {{
+              case "$2" in
+                %u) printf '0\\n' ;;
+                %h) printf '{links}\\n' ;;
+                *) return 1 ;;
+              esac
+            }}
+            lsattr() {{ blocked lsattr "$@"; }}
+            timeout() {{
+              if [[ "$4" != lsattr ]]; then blocked timeout "$@"; return 97; fi
+              record "inspect ${{@:4}}"
+              if [[ -d "${{@: -1}}" ]]; then
+                printf '%s %s\\n' '-------------' "${{@: -1}}"
+              else
+                printf '%s %s\\n' '----i--------' "${{@: -1}}"
+              fi
+            }}
+            run() {{
+              record "run $*"
+              case "$1" in
+                find)
+                  if [[ "$2" != "$UTS_TEST_ROOT/"* ]]; then blocked run "$@"; return 97; fi
+                  command "$@"
+                  ;;
+                chattr) return 0 ;;
+                *) blocked run "$@"; return 97 ;;
+              esac
+            }}
+        '''
+
+    def test_attribute_repair_refuses_multiply_linked_file(self):
+        target = self.root / "var/keep.txt"
+        target.write_text("keep\n")
+        linked = self.installation / "agent"
+        os.link(target, linked)
+        result = self.run_shell(
+            self.attribute_mocks(links=linked.stat().st_nlink)
+            + 'clear_blocking_attributes "${YUNJING_DIRS[0]}/agent"'
+        )
+        self.assert_failed(result)
+        self.assertIn("multiply linked file", result.stderr)
+        self.assertNotIn("run chattr", self.events.read_text())
+        self.assertEqual(target.read_text(), "keep\n")
+        self.assertEqual(linked.stat().st_nlink, 2)
+
+    def test_attribute_repair_never_follows_internal_symlinks(self):
+        outside = self.root / "var/keep.txt"
+        outside.write_text("keep\n")
+        link = self.installation / "external"
+        link.symlink_to(outside)
+        inside = self.installation / "agent"
+        inside.write_text("agent\n")
+        result = self.run_shell(
+            self.attribute_mocks()
+            + 'clear_blocking_attributes "${YUNJING_DIRS[0]}"'
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = self.events.read_text()
+        self.assertIn(f"run chattr -ia -- {inside}\n", events)
+        self.assertNotIn(str(outside), events)
+        self.assertNotIn(str(link), events)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(outside.read_text(), "keep\n")
+
+    def test_attribute_repair_is_limited_to_force_mode_and_selected_scope(self):
+        (self.installation / "agent").write_text("agent\n")
+        outside = self.root / "var/lib/other"
+        outside.mkdir()
+        for force, path, warning in (
+            (0, "${YUNJING_DIRS[0]}", None),
+            (1, "$UTS_TEST_ROOT/var/lib/other", "outside the selected component scope"),
+        ):
+            with self.subTest(force=force, path=path):
+                result = self.run_shell(
+                    self.attribute_mocks() + f'FORCE={force}\nclear_blocking_attributes "{path}"\n'
+                )
+                self.assert_failed(result)
+                self.assertEqual(self.events.read_text(), "")
+                if warning:
+                    self.assertIn(warning, result.stderr)
