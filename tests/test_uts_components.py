@@ -248,6 +248,39 @@ class YunjingTests(UtsFixture):
         self.assertFalse(self.vendor_log.exists())
         self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
 
+    def test_kernel_protection_blocks_cleanup_after_official_uninstaller(self):
+        self.enable_proc()
+        for official, dry_run, expected in (
+            (False, 0, 6),
+            (True, 0, 6),
+            (False, 1, 6),
+            (True, 1, 0),
+        ):
+            with self.subTest(official=official, dry_run=dry_run):
+                self.reset()
+                script = self.primary / "uninst.sh"
+                if official:
+                    self.vendor_script(script, "#!/bin/bash\nexit 0\n")
+                result = self.run_shell(
+                    ROOT_STAT
+                    + r"""
+                    path_present() { [[ "$1" == /dev/txyd || -e "$1" || -L "$1" ]]; }
+                    remove_cron_lines() { record cron; }
+                    stop_services() { record stop; }
+                    remove_path() { record "remove $1"; }
+                    """
+                    + f"exec 3>&1\nDRY_RUN={dry_run}\nuninstall_yunjing\n"
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                events = self.events.read_text().splitlines()
+                if expected:
+                    self.assertIn("Kernel protection device /dev/txyd remains", result.stderr)
+                    self.assertEqual(events, [self.official(script)] if official and not dry_run else [])
+                else:
+                    self.assertIn("the official uninstaller must remove it", result.stderr)
+                    self.assertIn(f"[DRY-RUN] would run official {script}", result.stdout)
+                    self.assertEqual(events, ["cron", "stop", *self.removals()])
+
     def test_missing_uninstaller_still_cleans_dirs_and_cron_lines(self):
         self.primary.mkdir(parents=True)
         result = self.run_shell(

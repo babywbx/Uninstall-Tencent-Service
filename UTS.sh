@@ -89,7 +89,7 @@ ${SCRIPT_NAME} ${VERSION}
 退出码：
   0         卸载已验证，或预览完成
   1         有步骤失败、仍有残留，或运行被拒绝、取消
-  6         因卸载保护或进程无法停止，主机安全 Agent 未被卸载
+  6         因卸载保护、内核保护或进程无法停止，主机安全 Agent 未被卸载
   124、137  命令超时被终止
   130、143  被中断
 HELP
@@ -117,7 +117,7 @@ Disable Agent uninstall protection in the Host Security console before running.
 Exit status:
   0         uninstall verified, or dry run finished
   1         a step failed, remnants remain, or the run was refused or canceled
-  6         uninstall protection or an unstoppable process kept Host Security
+  6         uninstall protection, kernel protection or an unstoppable process kept Host Security
   124, 137  a command timed out and was stopped
   130, 143  interrupted
 HELP
@@ -1183,6 +1183,15 @@ uninstall_yunjing() {
     warn "Official uninst.sh exited with status ${official_rc}." "官方 uninst.sh 退出码为 ${official_rc}。"
     warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
     return "${official_rc}"
+  fi
+  if path_present /dev/txyd; then
+    if [[ "${DRY_RUN}" -eq 1 && "${ran}" -eq 1 ]]; then
+      warn "Kernel protection device /dev/txyd is present; the official uninstaller must remove it." "存在内核保护设备 /dev/txyd，需要由官方卸载程序移除。"
+    else
+      warn "Kernel protection device /dev/txyd remains; preserving the installation." "内核保护设备 /dev/txyd 仍在，保留安装。"
+      warn "Uninstall the agent from the Host Security console, then run this script again." "请在主机安全控制台卸载 Agent 后再运行本脚本。"
+      return 6
+    fi
   fi
   remove_cron_lines /qcloud/YunJing/ || return $?
   remove_system_cron_lines /etc/cron.d/yunjing /qcloud/YunJing/ || return $?
