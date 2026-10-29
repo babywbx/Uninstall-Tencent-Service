@@ -1,0 +1,20 @@
+name: 功能建议
+description: 建议支持新的组件、系统或卸载场景
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 描述场景，例如哪个组件、哪个系统上卸载不干净
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 设想的做法
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+      description: 相关的官方文档、残留文件或进程列表等

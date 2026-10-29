@@ -1,0 +1,48 @@
+name: 问题反馈
+description: 报告卸载失败、残留或误报等可复现的问题
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿粘贴公网 IP、密钥、token 或其他敏感信息。
+  - type: input
+    id: system
+    attributes:
+      label: 系统与架构
+      placeholder: TencentOS Server 4，x86_64
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 脚本版本或提交
+      placeholder: UTS.sh --version 的输出或 commit SHA
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: 执行的命令
+      placeholder: sudo bash UTS.sh --include-monitor --include-tat
+    validations:
+      required: true
+  - type: input
+    id: status
+    attributes:
+      label: 退出码
+      placeholder: 0、1、6 等
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: 脚本输出
+      description: 粘贴完整输出。需要英文输出时加 --lang en。
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
