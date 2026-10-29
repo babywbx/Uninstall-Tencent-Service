@@ -478,6 +478,9 @@ class MainTests(UtsFixture):
                         self.assertNotIn("==> Host Security agent", output)
 
     def test_ctrl_c_at_the_prompt_changes_nothing(self):
+        mask_state = self.root / "var/lib/uts/created-masks"
+        mask_state.parent.mkdir(mode=0o700)
+        mask_state.write_text("/etc/systemd/system/gone.service\n")
         stubs = ROOT_STAT + self.STUBBED_MAIN + "prepare_runtime() { trap 'interrupt 130' INT; trap 'interrupt 143' TERM; }\n"
         result = self.run_shell(stubs + "main\n", **self.answer("n"))
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -503,9 +506,10 @@ class MainTests(UtsFixture):
             self.assertEqual(process.returncode, 130, stderr.decode())
             self.assertIn("Interrupted; run the script again to finish the cleanup.", stderr.decode())
             self.assertEqual(self.events.read_text(), "")
+            self.assertEqual(mask_state.read_text(), "/etc/systemd/system/gone.service\n")
         result = self.run_shell(stubs + "main\n", **self.answer("y"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.events.read_text().splitlines(), ["yunjing", "verify"])
+        self.assertEqual(self.events.read_text().splitlines(), [f"rm -f -- {mask_state}", f"rmdir -- {mask_state.parent}", "yunjing", "verify"])
 
     def test_previous_terminal_output_cannot_satisfy_the_current_prompt(self):
         previous = self.answer(None)

@@ -21,6 +21,7 @@ class ServiceTests(UtsFixture):
         self.unit = self.units / "tat_agent.service"
         self.init_script = self.root / "etc/init.d/tat_agent_service"
         self.upstart_conf = self.root / "etc/init/tat_agent_service.conf"
+        self.mask_state = self.root / "var/lib/uts/created-masks"
 
     def enable_systemd(self):
         (self.root / "run/systemd/system").mkdir(parents=True, exist_ok=True)
@@ -203,8 +204,9 @@ class ServiceTests(UtsFixture):
             ["run systemctl stop tat_agent.service", "run systemctl disable tat_agent.service"],
         )
         self.assertFalse(self.unit.is_symlink())
+        self.assertFalse(self.mask_state.exists())
 
-    def test_force_masks_loaded_units_with_a_backup(self):
+    def test_force_masks_loaded_units_and_records_ownership(self):
         self.enable_systemd()
         self.unit.write_text("[Service]\n")
         stargate = self.units / "stargate.service"
@@ -234,6 +236,8 @@ class ServiceTests(UtsFixture):
         )
         self.assertEqual(os.readlink(stargate), "/dev/null")
         self.assertEqual(os.readlink(self.unit), "/dev/null")
+        self.assertEqual(self.mask_state.read_text(), f"{stargate}\n{self.unit}\n")
+        self.assertEqual(self.mask_state.parent.stat().st_mode & 0o777, 0o700)
         self.assertIn("Masked tat_agent.service", result.stdout)
 
     def test_force_cleanup_removes_relative_enablement_link_and_releases_mask(self):
@@ -258,6 +262,7 @@ class ServiceTests(UtsFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(wants.is_symlink())
         self.assertFalse(self.unit.exists() or self.unit.is_symlink())
+        self.assertIn(f"rm -f -- {self.mask_state}\n", self.events.read_text())
 
     def test_cleanup_removes_service_files_then_reloads_systemd(self):
         self.enable_systemd()
@@ -316,6 +321,7 @@ class ServiceTests(UtsFixture):
             ["run systemctl stop tat_agent.service", "run systemctl daemon-reload"],
         )
         self.assertEqual(os.readlink(self.unit), "/dev/null")
+        self.assertFalse(self.mask_state.exists())
 
     def test_verify_services_passes_only_when_units_are_gone(self):
         self.enable_systemd()
@@ -347,6 +353,50 @@ class ServiceTests(UtsFixture):
                 else:
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(result.stderr, "")
+
+    def test_mask_state_rejects_untrusted_directory_or_file(self):
+        self.mask_state.parent.mkdir(mode=0o700)
+        self.mask_state.write_text("existing\n")
+        for name, file_owner, file_mode, directory_owner, directory_mode in (
+            ("directory mode", "0", "700", "0", "777"),
+            ("directory owner", "0", "600", "1000", "700"),
+            ("file mode", "0", "666", "0", "700"),
+            ("file owner", "1000", "600", "0", "700"),
+        ):
+            with self.subTest(case=name):
+                result = self.run_shell(
+                    f'''
+                    stat() {{
+                      if [[ "${{@: -1}}" == "$MASK_STATE" ]]; then
+                        case "$2" in
+                          %u) printf '{file_owner}\\n' ;;
+                          %a) printf '{file_mode}\\n' ;;
+                        esac
+                      else
+                        case "$2" in
+                          %u) printf '{directory_owner}\\n' ;;
+                          %a) printf '{directory_mode}\\n' ;;
+                        esac
+                      fi
+                    }}
+                    mask_state_ready || exit 1
+                    load_mask_state
+                    '''
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.mask_state.read_text(), "existing\n")
+
+    def test_mask_state_update_never_follows_existing_temporary_symlink(self):
+        self.mask_state.parent.mkdir(mode=0o700)
+        self.mask_state.write_text("remove\nkeep\n")
+        victim = self.base / "unrelated"
+        victim.write_text("must remain unchanged\n")
+        self.mask_state.with_suffix(".new").symlink_to(victim)
+        result = self.run_shell(self.systemd_mocks() + "mask_state_remove remove")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(victim.read_text(), "must remain unchanged\n")
+        self.assertEqual(self.mask_state.read_text(), "keep\n")
+        self.assertFalse(self.mask_state.is_symlink())
 
 
 class StopHookTests(UtsFixture):

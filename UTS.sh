@@ -15,6 +15,7 @@ QUERY_OUTPUT=""
 QUERY_ERROR=""
 MASK_BACKUP=""
 CREATED_MASKS=()
+STALE_MASKS=()
 LOCK_DIR="/run/uts.lock"
 PROC_ROOT="/proc"
 BACKUP_ROOT="/var/backups"
@@ -31,6 +32,8 @@ TAT_WORKDIR="/tmp/tat_agent"
 YUNJING_SERVICES=(YDService YDLive)
 MONITOR_SERVICES=(stargate)
 TAT_SERVICES=(tat_agent tat_agent_service tat_install)
+MASK_STATE_DIR="/var/lib/uts"
+MASK_STATE="${MASK_STATE_DIR}/created-masks"
 
 AUTO_YES=0
 INCLUDE_MONITOR=0
@@ -589,8 +592,66 @@ preserved_mask() {
   ! created_mask "$1"
 }
 
+mask_state_ready() {
+  [[ -d "${MASK_STATE_DIR}" ]] && root_owned_private "${MASK_STATE_DIR}" || return 1
+  [[ ! -L "${MASK_STATE}" ]] || return 1
+  [[ ! -e "${MASK_STATE}" ]] || { [[ -f "${MASK_STATE}" ]] && root_owned_private "${MASK_STATE}"; }
+}
+
+mask_state_add() {
+  if [[ ! -e "${MASK_STATE_DIR}" && ! -L "${MASK_STATE_DIR}" ]]; then
+    mkdir -m 700 -- "${MASK_STATE_DIR}" || return 1
+  fi
+  mask_state_ready || return 1
+  if [[ -f "${MASK_STATE}" ]] && grep -Fxq -- "$1" "${MASK_STATE}"; then
+    return 0
+  fi
+  (umask 077 && printf '%s\n' "$1" >>"${MASK_STATE}")
+}
+
+mask_state_remove() {
+  local rest="" replacement=""
+  [[ "${DRY_RUN}" -eq 0 && -f "${MASK_STATE}" ]] || return 0
+  mask_state_ready || return 1
+  rest="$(grep -Fxv -- "$1" "${MASK_STATE}")" || [[ $? -eq 1 ]] || return 1
+  if [[ -n "${rest}" ]]; then
+    replacement="$(mktemp "${MASK_STATE}.XXXXXX")" || return 1
+    if ! printf '%s\n' "${rest}" >"${replacement}" || ! mv -f -- "${replacement}" "${MASK_STATE}"; then
+      rm -f -- "${replacement}"
+      return 1
+    fi
+    return 0
+  fi
+  rm -f -- "${MASK_STATE}" || return 1
+  rmdir -- "${MASK_STATE_DIR}" 2>/dev/null || true
+}
+
+load_mask_state() {
+  local path=""
+  local -a stale=()
+  [[ -e "${MASK_STATE_DIR}" || -L "${MASK_STATE_DIR}" ]] || return 0
+  mask_state_ready || { warn "Unsafe mask state: ${MASK_STATE_DIR}." "屏蔽状态目录不安全：${MASK_STATE_DIR}。"; return 1; }
+  [[ -f "${MASK_STATE}" ]] || return 0
+  while IFS= read -r path; do
+    if [[ "${path}" =~ ^/etc/systemd/system/[A-Za-z0-9_.@-]+\.(service|timer|socket)$ \
+      && -L "${path}" && "$(readlink -- "${path}")" == /dev/null ]]; then
+      created_mask "${path}" || CREATED_MASKS+=("${path}")
+    else
+      stale+=("${path}")
+    fi
+  done <"${MASK_STATE}"
+  STALE_MASKS=(${stale[@]+"${stale[@]}"})
+}
+
+prune_mask_state() {
+  local path=""
+  for path in ${STALE_MASKS[@]+"${STALE_MASKS[@]}"}; do
+    mask_state_remove "${path}" || return 1
+  done
+}
+
 mask_selected_service() {
-  local unit="$1" path="/etc/systemd/system/$1" state=""
+  local unit="$1" path="/etc/systemd/system/$1" state="" rc=0
   if preserved_mask "${path}"; then
     return 0
   fi
@@ -610,7 +671,12 @@ mask_selected_service() {
     run cp -aL -- "${path}" "${MASK_BACKUP}/${unit}" || return $?
     log "Saved service definition: ${MASK_BACKUP}/${unit}." "已备份服务定义：${MASK_BACKUP}/${unit}。"
   fi
-  run ln -sfn -- /dev/null "${path}" || return $?
+  mask_state_add "${path}" || { warn "Cannot record mask ownership in ${MASK_STATE}." "无法在 ${MASK_STATE} 中记录屏蔽归属。"; return 1; }
+  run ln -sfn -- /dev/null "${path}" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    mask_state_remove "${path}" || warn "Cannot update ${MASK_STATE}." "无法更新 ${MASK_STATE}。"
+    return "${rc}"
+  fi
   CREATED_MASKS+=("${path}")
   run systemctl daemon-reload || return $?
   query systemctl show -p LoadState "${unit}" || return $?
@@ -791,7 +857,10 @@ release_service_masks() {
         "${svc}.service"|"${svc}.timer"|"${svc}.socket") ;;
         *) continue ;;
       esac
-      path_present "${path}" || continue
+      if ! path_present "${path}"; then
+        mask_state_remove "${path}" || rc=1
+        continue
+      fi
       if [[ ! -L "${path}" || "$(readlink -- "${path}")" != /dev/null ]]; then
         warn "Service mask changed during cleanup: ${path}." "清理期间服务屏蔽发生变化：${path}。"
         rc=1; continue
@@ -801,6 +870,7 @@ release_service_masks() {
       if [[ "${DRY_RUN}" -eq 0 ]] && path_present "${path}"; then
         rc=1; continue
       fi
+      mask_state_remove "${path}" || rc=1
     done
   done
   if [[ "${changed}" -eq 1 ]] && systemd_available; then
@@ -1497,11 +1567,13 @@ main() {
   require_root
   detect_distro
   prepare_runtime
+  load_mask_state || die "Unsafe mask state. No uninstall was attempted." "屏蔽状态不安全，未执行任何卸载。"
   preflight_paths || die "Unsafe installation paths. No uninstall was attempted." "安装路径不安全，未执行任何卸载。"
   preflight_launcher || die "Run from an SSH session or a detached unit such as systemd-run. No uninstall was attempted." \
     "请在 SSH 会话或 systemd-run 等独立单元中运行，未执行任何卸载。"
   log "System: ${DISTRO_PRETTY}, $(uname -m)" "系统：${DISTRO_PRETTY}，$(uname -m)"
   confirm
+  prune_mask_state || die "Cannot update ${MASK_STATE}. No uninstall was attempted." "无法更新 ${MASK_STATE}，未执行任何卸载。"
 
   uninstall_yunjing || yunjing_rc=$?
   if [[ "${yunjing_rc}" -ne 0 ]]; then

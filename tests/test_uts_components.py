@@ -463,6 +463,9 @@ class YunjingTests(UtsFixture):
             mask = self.root / "etc/systemd/system/YDService.service"
             mask.parent.mkdir(parents=True)
             mask.symlink_to("/dev/null")
+            state = self.root / "var/lib/uts/created-masks"
+            state.parent.mkdir(mode=0o700)
+            state.write_text(f"{mask}\n")
             result = self.run_shell(
                 r"""
                 stat() {
@@ -486,6 +489,7 @@ class YunjingTests(UtsFixture):
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertFalse(self.primary.exists())
             self.assertTrue(mask.is_symlink())
+            self.assertEqual(state.read_text(), f"{mask}\n")
             self.assertIn("scan-failed", self.events.read_text())
 
 
