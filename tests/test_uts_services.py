@@ -204,6 +204,61 @@ class ServiceTests(UtsFixture):
         )
         self.assertFalse(self.unit.is_symlink())
 
+    def test_force_masks_loaded_units_with_a_backup(self):
+        self.enable_systemd()
+        self.unit.write_text("[Service]\n")
+        stargate = self.units / "stargate.service"
+        stargate.write_text("[Service]\n")
+        result = self.run_shell(
+            self.systemd_mocks()
+            + r'''
+            run() { record "run $*"; [[ "$1" != ln ]] || command "$@"; }
+            FORCE=1
+            stop_services "${MONITOR_SERVICES[@]}" "${TAT_SERVICES[@]}"
+            '''
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        backup = next((self.root / "var/backups").glob("uts-units.*"))
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            [
+                "run systemctl stop stargate.service",
+                f"run cp -aL -- {stargate} {backup}/stargate.service",
+                f"run ln -sfn -- /dev/null {stargate}",
+                "run systemctl daemon-reload",
+                "run systemctl stop tat_agent.service",
+                f"run cp -aL -- {self.unit} {backup}/tat_agent.service",
+                f"run ln -sfn -- /dev/null {self.unit}",
+                "run systemctl daemon-reload",
+            ],
+        )
+        self.assertEqual(os.readlink(stargate), "/dev/null")
+        self.assertEqual(os.readlink(self.unit), "/dev/null")
+        self.assertIn("Masked tat_agent.service", result.stdout)
+
+    def test_force_cleanup_removes_relative_enablement_link_and_releases_mask(self):
+        self.enable_systemd()
+        self.unit.write_text("[Service]\n")
+        wants = self.units / "multi-user.target.wants/tat_agent.service"
+        wants.parent.mkdir()
+        wants.symlink_to("../tat_agent.service")
+        result = self.run_shell(
+            self.systemd_mocks()
+            + r'''
+            run() {
+              record "run $*"
+              case "$1" in ln|cp|rm) command "$@" ;; esac
+            }
+            FORCE=1
+            stop_services tat_agent || exit $?
+            cleanup_services tat_agent || exit $?
+            release_service_masks tat_agent || exit $?
+            '''
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(wants.is_symlink())
+        self.assertFalse(self.unit.exists() or self.unit.is_symlink())
+
     def test_cleanup_removes_service_files_then_reloads_systemd(self):
         self.enable_systemd()
         files = self.tat_files()
@@ -248,6 +303,8 @@ class ServiceTests(UtsFixture):
                 *) printf 'ActiveState=inactive\n' ;;
               esac
             }
+            FORCE=1
+            mask_selected_service tat_agent.service
             stop_services tat_agent
             cleanup_services tat_agent
             verify_services tat_agent
@@ -265,9 +322,10 @@ class ServiceTests(UtsFixture):
         gone = "LoadState=not-found\\nActiveState=inactive\\nFragmentPath=\\n"
         remaining = f"LoadState=loaded\\nActiveState=active\\nFragmentPath={self.unit}\\n"
         self.unit.symlink_to("/dev/null")
-        for case, state, warning in (
-            ("gone", gone, None),
-            ("remaining", remaining, f"Service remains or cannot be verified: tat_agent.service (loaded, active, {self.unit})."),
+        for case, state, masks, warning in (
+            ("gone", gone, "", None),
+            ("remaining", remaining, "", f"Service remains or cannot be verified: tat_agent.service (loaded, active, {self.unit})."),
+            ("owned mask", gone, '("$UTS_TEST_ROOT/etc/systemd/system/tat_agent.service")', f"A mask created by this script remains: {self.unit}"),
         ):
             with self.subTest(case=case):
                 result = self.run_shell(
@@ -279,6 +337,7 @@ class ServiceTests(UtsFixture):
                         *) printf '{gone}' ;;
                       esac
                     }}
+                    CREATED_MASKS={masks or "()"}
                     verify_services "${{TAT_SERVICES[@]}}"
                     '''
                 )

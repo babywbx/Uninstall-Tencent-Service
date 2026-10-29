@@ -13,8 +13,11 @@ FAILURES=0
 RUN_PID=""
 QUERY_OUTPUT=""
 QUERY_ERROR=""
+MASK_BACKUP=""
+CREATED_MASKS=()
 LOCK_DIR="/run/uts.lock"
 PROC_ROOT="/proc"
+BACKUP_ROOT="/var/backups"
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
 YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
 YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup)
@@ -82,7 +85,8 @@ ${SCRIPT_NAME} ${VERSION}
       --include-tat        同时卸载腾讯云自动化助手（tat_agent）
       --dry-run            只预览将要停止和删除的内容，不做任何修改
       --force              出错后继续清理：官方卸载程序失败时仍做本地清理，对已确认的
-                           Agent 进程使用 SIGKILL
+                           Agent 进程使用 SIGKILL，屏蔽服务单元（原定义备份到
+                           /var/backups）
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
   -h, --help               显示本帮助
 
@@ -111,7 +115,8 @@ Options:
       --include-tat        Also uninstall TencentCloud Automation Tools (tat_agent)
       --dry-run            Show what would be stopped or removed, change nothing
       --force              Keep cleaning after failures: clean locally when an official
-                           uninstaller fails and SIGKILL verified agent processes
+                           uninstaller fails, SIGKILL verified agent processes, mask
+                           service units (definitions backed up to /var/backups)
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
   -h, --help               Show this help message
 
@@ -571,8 +576,50 @@ systemd_available() {
   [[ -d /run/systemd/system ]] && command_exists systemctl
 }
 
+created_mask() {
+  local path="$1" created=""
+  for created in ${CREATED_MASKS[@]+"${CREATED_MASKS[@]}"}; do
+    [[ "${created}" != "${path}" ]] || return 0
+  done
+  return 1
+}
+
 preserved_mask() {
-  [[ -L "$1" && "$(readlink -- "$1")" == /dev/null ]]
+  [[ -L "$1" && "$(readlink -- "$1")" == /dev/null ]] || return 1
+  ! created_mask "$1"
+}
+
+mask_selected_service() {
+  local unit="$1" path="/etc/systemd/system/$1" state=""
+  if preserved_mask "${path}"; then
+    return 0
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "Would preserve ${unit}'s local definition and mask it during force cleanup." "强制清理时将备份 ${unit} 的本地定义并屏蔽它。"
+    return 0
+  fi
+  if path_present "${path}"; then
+    [[ -f "${path}" && "$(stat -c '%u' "${path}")" == 0 ]] || return 1
+    if [[ -z "${MASK_BACKUP}" ]]; then
+      if [[ ! -d "${BACKUP_ROOT}" ]]; then
+        mkdir -m 700 -- "${BACKUP_ROOT}" || return 1
+      fi
+      [[ ! -L "${BACKUP_ROOT}" && "$(stat -c '%u' "${BACKUP_ROOT}")" == 0 ]] || return 1
+      MASK_BACKUP="$(mktemp -d "${BACKUP_ROOT}/uts-units.XXXXXX")" || return 1
+    fi
+    run cp -aL -- "${path}" "${MASK_BACKUP}/${unit}" || return $?
+    log "Saved service definition: ${MASK_BACKUP}/${unit}." "已备份服务定义：${MASK_BACKUP}/${unit}。"
+  fi
+  run ln -sfn -- /dev/null "${path}" || return $?
+  CREATED_MASKS+=("${path}")
+  run systemctl daemon-reload || return $?
+  query systemctl show -p LoadState "${unit}" || return $?
+  state="${QUERY_OUTPUT}"
+  if [[ "${state}" != LoadState=masked ]]; then
+    warn "Service mask is not effective: ${unit}." "服务屏蔽未生效：${unit}。"
+    return 1
+  fi
+  log "Masked ${unit} against activation during cleanup; failed cleanup leaves the mask for the next run." "清理期间已屏蔽 ${unit} 防止被激活，清理失败时屏蔽会保留到下次运行。"
 }
 
 component_command() {
@@ -686,7 +733,10 @@ stop_services() {
         state="${state#LoadState=}"
         [[ "${state}" != not-found ]] || continue
         component_command systemctl stop "${svc}.${suffix}" || return $?
-        if [[ "${state}" != masked ]]; then
+        if [[ "${FORCE}" -eq 1 && "${state}" != masked ]]; then
+          mask_selected_service "${svc}.${suffix}" || return $?
+        fi
+        if [[ "${FORCE}" -eq 0 && "${state}" != masked ]]; then
           run systemctl disable "${svc}.${suffix}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
         fi
       done
@@ -707,6 +757,7 @@ stop_services() {
 cleanup_services() {
   local file="" svc="" suffix="" state="" rc=0 query_rc=0
   while IFS= read -r file; do
+    created_mask "${file}" && continue
     if [[ "${file}" == *.d ]]; then
       remove_path "${file}" tree || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
     else
@@ -732,11 +783,45 @@ cleanup_services() {
   return "${rc}"
 }
 
+release_service_masks() {
+  local svc="" path="" changed=0 rc=0
+  for svc in "$@"; do
+    for path in ${CREATED_MASKS[@]+"${CREATED_MASKS[@]}"}; do
+      case "${path##*/}" in
+        "${svc}.service"|"${svc}.timer"|"${svc}.socket") ;;
+        *) continue ;;
+      esac
+      path_present "${path}" || continue
+      if [[ ! -L "${path}" || "$(readlink -- "${path}")" != /dev/null ]]; then
+        warn "Service mask changed during cleanup: ${path}." "清理期间服务屏蔽发生变化：${path}。"
+        rc=1; continue
+      fi
+      run rm -f -- "${path}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; continue; }
+      changed=1
+      if [[ "${DRY_RUN}" -eq 0 ]] && path_present "${path}"; then
+        rc=1; continue
+      fi
+    done
+  done
+  if [[ "${changed}" -eq 1 ]] && systemd_available; then
+    run systemctl daemon-reload || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  fi
+  return "${rc}"
+}
+
 verify_services() {
   systemd_available || return 0
-  local svc="" suffix="" state="" key="" value="" load="" active="" fragment="" root="" preserved=0 rc=0
+  local svc="" suffix="" state="" key="" value="" load="" active="" fragment="" root="" path="" preserved=0 owned=0 rc=0
   for svc in "$@"; do
     for suffix in service timer socket; do
+      owned=0
+      for path in ${CREATED_MASKS[@]+"${CREATED_MASKS[@]}"}; do
+        if [[ "${path##*/}" == "${svc}.${suffix}" ]] && path_present "${path}"; then
+          warn "A mask created by this script remains: ${path}." "本脚本创建的屏蔽仍然存在：${path}。"
+          owned=1; rc=1
+        fi
+      done
+      [[ "${owned}" -eq 0 ]] || continue
       query systemctl show -p LoadState -p ActiveState -p FragmentPath "${svc}.${suffix}" || return $?
       state="${QUERY_OUTPUT}"
       load=""; active=""; fragment=""
@@ -1282,6 +1367,7 @@ uninstall_yunjing() {
   if [[ "${present}" -eq 1 ]]; then
     guard_check || return $?
   fi
+  release_service_masks "${YUNJING_SERVICES[@]}"
 }
 
 uninstall_monitor() {
@@ -1313,6 +1399,9 @@ uninstall_monitor() {
     remove_empty_dir "${dir}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   done
   remove_paths file "${MONITOR_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  if [[ "${rc}" -eq 0 ]]; then
+    release_service_masks "${MONITOR_SERVICES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  fi
   return "${rc}"
 }
 
@@ -1333,6 +1422,9 @@ uninstall_tat() {
     fi
   fi
   remove_paths file "${TAT_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  if [[ "${rc}" -eq 0 ]]; then
+    release_service_masks "${TAT_SERVICES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  fi
   return "${rc}"
 }
 

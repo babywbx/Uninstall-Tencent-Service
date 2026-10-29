@@ -27,6 +27,7 @@ LATER_STEPS = r"""
     cleanup_services() { record "cleanup-services $*"; }
     remove_path() { record "remove $1"; }
     remove_empty_dir() { record "remove-empty $1"; }
+    release_service_masks() { record "release $*"; }
     INCLUDE_MONITOR=1
 """
 
@@ -78,6 +79,7 @@ class YunjingTests(UtsFixture):
         root_crontab() { :; }
         remove_path() { record "remove $1"; }
         guard_check() { record guard; }
+        release_service_masks() { record "release $*"; }
     """
 
     def setUp(self):
@@ -98,6 +100,7 @@ class YunjingTests(UtsFixture):
             "cleanup-services YDService YDLive",
             *self.removals(),
             "guard",
+            "release YDService YDLive",
         ]
 
     def removals(self):
@@ -423,7 +426,26 @@ class YunjingTests(UtsFixture):
         self.primary.mkdir(parents=True)
         self.assertEqual(self.run_shell("yunjing_present").returncode, 0)
 
-    def test_process_scan_failure_returns_2(self):
+    def test_masks_are_released_only_after_clean_guard_check(self):
+        self.primary.mkdir(parents=True)
+        for guard_rc, removal_rc, expected_rc in ((0, 0, 0), (6, 0, 6), (0, 1, 1)):
+            with self.subTest(guard=guard_rc, removal=removal_rc):
+                result = self.run_shell(
+                    self.local_stubs
+                    + f'remove_path() {{ record "remove $1"; return {removal_rc}; }}\n'
+                    + f"guard_check() {{ record guard; return {guard_rc}; }}\n"
+                    + "uninstall_yunjing\n"
+                )
+                self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
+                events = self.events.read_text().splitlines()
+                if expected_rc == 0:
+                    self.assertEqual(events[-2:], ["guard", "release YDService YDLive"])
+                else:
+                    self.assertNotIn("release YDService YDLive", events)
+                if removal_rc:
+                    self.assertNotIn("guard", events)
+
+    def test_process_scan_failure_returns_2_and_preserves_masks(self):
         with self.subTest(stage="initial"):
             result = self.run_shell(
                 r"""
@@ -438,6 +460,9 @@ class YunjingTests(UtsFixture):
             (self.primary / "agent").parent.mkdir(parents=True)
             (self.primary / "agent").touch()
             self.enable_proc()
+            mask = self.root / "etc/systemd/system/YDService.service"
+            mask.parent.mkdir(parents=True)
+            mask.symlink_to("/dev/null")
             result = self.run_shell(
                 r"""
                 stat() {
@@ -453,12 +478,14 @@ class YunjingTests(UtsFixture):
                 root_crontab() { :; }
                 agent_processes() { record scan-failed; return 1; }
                 run() { record "run $*"; command "$@"; }
+                CREATED_MASKS=("$UTS_TEST_ROOT/etc/systemd/system/YDService.service")
                 GUARD_WAIT=60
                 uninstall_yunjing
                 """
             )
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertFalse(self.primary.exists())
+            self.assertTrue(mask.is_symlink())
             self.assertIn("scan-failed", self.events.read_text())
 
 
@@ -522,6 +549,7 @@ class MonitorTests(UtsFixture):
                         "cleanup-services stargate",
                     ],
                 )
+                self.assertEqual(events[-1], "release stargate")
 
     def test_official_failure_stops_unless_forced(self):
         for name, payload, status in (
@@ -792,6 +820,7 @@ class TatTests(UtsFixture):
             stat() { printf '0\n'; }
             root_crontab() { :; }
             stop_services() { record "stop-services $*"; }
+            release_service_masks() { record "release $*"; }
             kill() { record "kill $*"; mv "${UTS_TEST_ROOT}/proc/$2" "${UTS_TEST_ROOT}/tmp/exited-$2"; }
             run() { record "run $*"; [[ "$1" != rm ]] || command "$@"; }
             INCLUDE_TAT=1
@@ -811,12 +840,13 @@ class TatTests(UtsFixture):
                 *(f"run rm -f -- {path}" for path in files),
                 *(f"run rm -rf -- {path}" for path in self.tat_dirs),
                 *(f"run rm -f -- {path}" for path in self.leftovers),
+                f"release {TAT_SERVICES}",
             ],
         )
         for path in (*self.tat_dirs, *files, *self.leftovers):
             self.assertFalse(path.exists() or path.is_symlink(), path)
 
-    def test_failed_leftover_removal_fails_tat(self):
+    def test_failed_leftover_removal_fails_tat_and_skips_mask_release(self):
         install_tat(self.root)
         self.enable_proc()
         result = self.run_shell(
@@ -826,6 +856,7 @@ class TatTests(UtsFixture):
             stop_services() { :; }
             stop_agent_processes() { :; }
             cleanup_services() { :; }
+            release_service_masks() { record "release $*"; }
             run() {
               record "run $*"
               [[ "$*" != *tat_agent.pid ]] || return 1
@@ -916,6 +947,7 @@ class ComponentTests(UtsFixture):
                             + "remove_cron_lines() { :; }\nremove_system_cron_lines() { :; }\n"
                             + "stop_services() { :; }\nstop_agent_processes() { :; }\n"
                             + "cleanup_services() { :; }\nremove_paths() { record remove; }\n"
+                            + "release_service_masks() { record release; }\n"
                             + f"{failing}() {{ record timed-out; return {status}; }}\n"
                             + f"uninstall_{component}\n"
                         )
@@ -936,6 +968,7 @@ class ComponentTests(UtsFixture):
                     stop_services() { record "stop-services $*"; }
                     stop_agent_processes() { record "stop-processes $*"; }
                     cleanup_services() { record "cleanup-services $*"; }
+                    release_service_masks() { record "release $*"; }
                     """
                     + f"uninstall_{component}\n"
                 )
