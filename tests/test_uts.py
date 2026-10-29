@@ -269,7 +269,7 @@ class MainTests(UtsFixture):
         chinese = invoke(["--help"]).stdout
         self.assertIn("Usage:", english)
         options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
-        self.assertGreaterEqual(len(options), 6)
+        self.assertGreaterEqual(len(options), 7)
         self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
         for code in ("0", "1", "6", "124, 137", "130, 143"):
             self.assertRegex(english, rf"(?m)^  {code}\s+\w")
@@ -381,7 +381,7 @@ class MainTests(UtsFixture):
     def test_confirmation_needs_a_terminal_unless_yes_or_dry_run(self):
         for options, code, events in (
             ("", 1, []),
-            ("--include-tat", 1, []),
+            ("--force --include-tat", 1, []),
             ("--yes", 0, ["yunjing", "verify"]),
             ("--dry-run", 0, ["yunjing"]),
         ):
@@ -547,7 +547,7 @@ class MainTests(UtsFixture):
                     self.STUBBED_MAIN
                     + 'uninstall_monitor() { section "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"; return 1; }\n'
                     + "verify_uninstall() { warn \"Agent processes remain:\" \"仍有 Agent 进程：\"; return 1; }\n"
-                    + f"UI_LANG={language}\nmain --yes --include-monitor --include-tat\n"
+                    + f"UI_LANG={language}\nmain --yes --force --include-monitor --include-tat\n"
                 )
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
@@ -560,9 +560,18 @@ class MainTests(UtsFixture):
                     self.assertIn("云监控（BaradAgent / Sgagent）卸载未完成（1）。", result.stderr)
                     self.assertIn("Uninstall-Tencent-Service：未完成", result.stderr)
 
-    def test_yunjing_failure_skips_optional_components(self):
-        for status in (1, 7, 6, 124, 137):
-            with self.subTest(status=status):
+    def test_yunjing_status_controls_optional_components(self):
+        for status, force, continued in (
+            (1, 0, False),
+            (7, 0, False),
+            (6, 0, False),
+            (124, 1, False),
+            (137, 1, False),
+            (1, 1, True),
+            (6, 1, True),
+        ):
+            with self.subTest(status=status, force=force):
+                options = "--yes --include-monitor --include-tat" + (" --force" if force else "")
                 result = self.run_shell(
                     f"uninstall_yunjing() {{ record yunjing; return {status}; }}\n"
                     + r"""
@@ -570,12 +579,13 @@ class MainTests(UtsFixture):
                     uninstall_tat() { record tat; }
                     verify_uninstall() { record verify; }
                     """
-                    + "main --yes --include-monitor --include-tat\n"
+                    + f"main {options}\n"
                 )
                 self.assertEqual(result.returncode, status if status in (6, 124, 137) else 1, result.stdout + result.stderr)
-                self.assertEqual(self.events.read_text().splitlines(), ["yunjing"])
+                expected = ["yunjing"] + (["monitor", "tat", "verify"] if continued else [])
+                self.assertEqual(self.events.read_text().splitlines(), expected)
                 self.assertIn(f"Host Security agent (YunJing) uninstall is incomplete ({status})", result.stderr)
-                self.assertIn("optional components were not processed", result.stderr)
+                self.assertEqual("optional components were not processed" in result.stderr, not continued)
                 self.assertNotIn("local uninstall verified", result.stdout)
                 self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
 
@@ -589,7 +599,7 @@ class MainTests(UtsFixture):
                         "uninstall_tat() { record tat; }\n"
                         f"uninstall_{component}() {{ record {component}; return {status}; }}\n"
                         "verify_uninstall() { record verify; }\n"
-                        "main --yes --include-monitor --include-tat"
+                        "main --yes --force --include-monitor --include-tat"
                     )
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                     self.assertEqual(
@@ -603,25 +613,27 @@ class MainTests(UtsFixture):
     def test_service_timeout_is_preserved_through_real_component_and_main(self):
         for component in ("yunjing", "monitor", "tat"):
             for status in (124, 137, 143):
-                with self.subTest(component=component, status=status):
-                    stubs = ""
-                    for other in ("yunjing", "monitor", "tat"):
-                        if other != component:
-                            stubs += f"uninstall_{other}() {{ record {other}; }}\n"
-                    result = self.run_shell(
-                        stubs
-                        + "agent_processes() { :; }\n"
-                        + "remove_cron_lines() { :; }\n"
-                        + "remove_system_cron_lines() { :; }\n"
-                        + "systemd_available() { return 1; }\n"
-                        + f"stop_services() {{ record service-timeout; return {status}; }}\n"
-                        + "verify_uninstall() { record verify; }\n"
-                        + "main --yes --include-monitor --include-tat"
-                    )
-                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
-                    previous = {"yunjing": [], "monitor": ["yunjing"], "tat": ["yunjing", "monitor"]}
-                    self.assertEqual(self.events.read_text().splitlines(), previous[component] + ["service-timeout"])
-                    self.assertNotIn("local uninstall verified", result.stdout)
+                for force in (False, True):
+                    with self.subTest(component=component, status=status, force=force):
+                        stubs = ""
+                        for other in ("yunjing", "monitor", "tat"):
+                            if other != component:
+                                stubs += f"uninstall_{other}() {{ record {other}; }}\n"
+                        result = self.run_shell(
+                            stubs
+                            + "agent_processes() { :; }\n"
+                            + "remove_cron_lines() { :; }\n"
+                            + "remove_system_cron_lines() { :; }\n"
+                            + "systemd_available() { return 1; }\n"
+                            + f"stop_services() {{ record service-timeout; return {status}; }}\n"
+                            + "verify_uninstall() { record verify; }\n"
+                            + "main --yes --include-monitor --include-tat"
+                            + (" --force" if force else "")
+                        )
+                        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                        previous = {"yunjing": [], "monitor": ["yunjing"], "tat": ["yunjing", "monitor"]}
+                        self.assertEqual(self.events.read_text().splitlines(), previous[component] + ["service-timeout"])
+                        self.assertNotIn("local uninstall verified", result.stdout)
 
     def test_reappearing_agent_is_reported_as_uninstall_protection(self):
         primary = self.root / "usr/local/qcloud/YunJing"

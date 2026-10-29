@@ -164,7 +164,7 @@ class YunjingTests(UtsFixture):
         self.assertEqual(self.events.read_text().splitlines()[-3:], ["monitor", "tat", "verify"])
         self.assertIn("local uninstall verified", result.stdout)
 
-    def test_official_uninstaller_failure_stops_local_cleanup(self):
+    def test_official_uninstaller_failure_stops_unless_forced(self):
         cases = (
             ("unknown format", b"MZ\x90\x00 not a shell script\n", 1, "Unrecognized uninstaller format", False),
             ("not executable", None, 1, "Empty or non-executable uninstaller", False),
@@ -176,31 +176,37 @@ class YunjingTests(UtsFixture):
             ("exit 137", b"#!/bin/bash\nexit 137\n", 137, "Command failed (137)", True),
         )
         for name, payload, status, warning, executed in cases:
-            with self.subTest(case=name):
-                self.reset()
-                script = self.primary / "uninst.sh"
-                if name == "symlink":
-                    self.primary.mkdir(parents=True)
-                    script.symlink_to(self.vendor_script(self.base / "target.sh", self.logging_script("target")))
-                elif name == "not executable":
-                    self.vendor_script(script, self.logging_script("not-executable")).chmod(0o644)
-                else:
-                    self.vendor_script(script, payload)
-                result = self.run_shell(self.executed())
-                official = [self.official(script, "timeout -k 5 120")] if executed else []
-                expected = status
-                if expected is None:
-                    reported = re.search(r"Official uninst\.sh exited with status (\d+)\.", result.stderr)
-                    self.assertIsNotNone(reported, result.stderr)
-                    expected = int(reported[1])
-                    self.assertTrue(0 < expected < 128 and expected != 124, expected)
-                self.assertFalse(self.vendor_log.exists())
-                self.assertIn(warning, result.stderr)
-                self.assertIn(f"Official uninst.sh exited with status {expected}.", result.stderr)
-                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                self.assertIn("Local cleanup was not started.", result.stderr)
-                self.assertEqual(self.events.read_text().splitlines(), official)
-                self.assertTrue(script.is_symlink() or script.is_file())
+            for force in (0, 1):
+                with self.subTest(case=name, force=force):
+                    self.reset()
+                    script = self.primary / "uninst.sh"
+                    if name == "symlink":
+                        self.primary.mkdir(parents=True)
+                        script.symlink_to(self.vendor_script(self.base / "target.sh", self.logging_script("target")))
+                    elif name == "not executable":
+                        self.vendor_script(script, self.logging_script("not-executable")).chmod(0o644)
+                    else:
+                        self.vendor_script(script, payload)
+                    result = self.run_shell(self.executed(f"FORCE={force}\n"))
+                    official = [self.official(script, "timeout -k 5 120")] if executed else []
+                    expected = status
+                    if expected is None:
+                        reported = re.search(r"Official uninst\.sh exited with status (\d+)\.", result.stderr)
+                        self.assertIsNotNone(reported, result.stderr)
+                        expected = int(reported[1])
+                        self.assertTrue(0 < expected < 128 and expected != 124, expected)
+                    self.assertFalse(self.vendor_log.exists())
+                    self.assertIn(warning, result.stderr)
+                    self.assertIn(f"Official uninst.sh exited with status {expected}.", result.stderr)
+                    if force and expected != 124 and expected < 128:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn("Force mode: trying scoped local cleanup.", result.stderr)
+                        self.assertEqual(self.events.read_text().splitlines(), official + self.local_cleanup())
+                    else:
+                        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                        self.assertIn("Local cleanup was not started.", result.stderr)
+                        self.assertEqual(self.events.read_text().splitlines(), official)
+                        self.assertTrue(script.is_symlink() or script.is_file())
 
     def test_untrusted_official_uninstaller_is_skipped_for_local_cleanup(self):
         script = self.vendor_script(self.primary / "uninst.sh", self.logging_script("untrusted"))
@@ -239,26 +245,30 @@ class YunjingTests(UtsFixture):
         self.vendor_script(self.primary / "uninst.sh", self.logging_script("untrusted"))
         agent = str(self.primary / "YDEyes/YDService")
         self.process(4242, agent, [agent])
-        result = self.run_shell(
-            self.local_stubs
-            + EXECUTE
-            + self.real_function("run")
-            + ROOT_STAT.replace("755", "666")
-            + "uninstall_yunjing\n"
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(self.vendor_log.exists())
-        self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
+        for force in (0, 1):
+            with self.subTest(force=force):
+                result = self.run_shell(
+                    self.local_stubs
+                    + EXECUTE
+                    + self.real_function("run")
+                    + ROOT_STAT.replace("755", "666")
+                    + f"FORCE={force}\nuninstall_yunjing\n"
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(self.vendor_log.exists())
+                self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
 
     def test_kernel_protection_blocks_cleanup_after_official_uninstaller(self):
         self.enable_proc()
-        for official, dry_run, expected in (
-            (False, 0, 6),
-            (True, 0, 6),
-            (False, 1, 6),
-            (True, 1, 0),
+        for official, dry_run, force, expected in (
+            (False, 0, 0, 6),
+            (False, 0, 1, 6),
+            (True, 0, 0, 6),
+            (True, 0, 1, 6),
+            (False, 1, 0, 6),
+            (True, 1, 0, 0),
         ):
-            with self.subTest(official=official, dry_run=dry_run):
+            with self.subTest(official=official, dry_run=dry_run, force=force):
                 self.reset()
                 script = self.primary / "uninst.sh"
                 if official:
@@ -271,7 +281,7 @@ class YunjingTests(UtsFixture):
                     stop_services() { record stop; }
                     remove_path() { record "remove $1"; }
                     """
-                    + f"exec 3>&1\nDRY_RUN={dry_run}\nuninstall_yunjing\n"
+                    + f"exec 3>&1\nDRY_RUN={dry_run}\nFORCE={force}\nuninstall_yunjing\n"
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 events = self.events.read_text().splitlines()
@@ -308,21 +318,25 @@ class YunjingTests(UtsFixture):
         self.assertEqual((self.root / "tmp/crontab").read_text(), "0 3 * * * /usr/local/bin/backup.sh\n")
 
     def test_unstoppable_processes_return_6_with_console_hint(self):
-        result = self.run_shell(
-            self.local_stubs
-            + r"""
-            agent_processes() { printf '4242|/a/YDService|1|x\n'; }
-            signal_agent_processes() { record "signal $1"; }
-            """
-            + self.real_function("stop_agent_processes")
-            + "uninstall_yunjing\n"
-        )
-        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
-        expected = ["stop-services YDService YDLive", "signal TERM"] + ["sleep 1"] * 5
-        self.assertEqual(self.events.read_text().splitlines(), expected)
-        self.assertIn("Agent processes remain; preserving their installation files:", result.stderr)
-        self.assertIn("PID 4242", result.stderr)
-        self.assertIn("turn off Agent uninstall protection", result.stderr)
+        for force in (0, 1):
+            with self.subTest(force=force):
+                result = self.run_shell(
+                    self.local_stubs
+                    + r"""
+                    agent_processes() { printf '4242|/a/YDService|1|x\n'; }
+                    signal_agent_processes() { record "signal $1"; }
+                    """
+                    + self.real_function("stop_agent_processes")
+                    + f"FORCE={force}\nuninstall_yunjing\n"
+                )
+                self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+                expected = ["stop-services YDService YDLive", "signal TERM"] + ["sleep 1"] * 5
+                if force:
+                    expected += ["signal KILL", "sleep 1"]
+                self.assertEqual(self.events.read_text().splitlines(), expected)
+                self.assertIn("Agent processes remain; preserving their installation files:", result.stderr)
+                self.assertIn("PID 4242", result.stderr)
+                self.assertIn("turn off Agent uninstall protection", result.stderr)
 
     def test_guard_check_polls_every_five_seconds_for_a_minute(self):
         self.enable_proc()
@@ -509,25 +523,40 @@ class MonitorTests(UtsFixture):
                     ],
                 )
 
-    def test_official_failure_stops_monitor_cleanup(self):
+    def test_official_failure_stops_unless_forced(self):
         for name, payload, status in (
             ("unknown format", b"MZ\x90\x00 not a shell script\n", 1),
             ("exit 7", b"#!/bin/bash\nexit 7\n", 7),
             ("exit 124", b"#!/bin/bash\nexit 124\n", 124),
         ):
-            with self.subTest(case=name):
-                self.reset()
-                monitor, stargate = install_monitor(self.root, "usr/local/qcloud", scripts=False)
-                barad = self.vendor_script(monitor / "barad/admin/uninstall.sh", payload)
-                self.vendor_script(stargate / "admin/uninstall.sh", self.logging_script("sgagent"))
-                result = self.run_shell(
-                    ROOT_STAT + EXECUTE + self.real_function("run") + LATER_STEPS + "uninstall_monitor\n"
-                )
-                barad_run = [] if name == "unknown format" else [self.official(barad, "timeout -k 5 120")]
-                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
-                self.assertFalse(self.vendor_log.exists())
-                self.assertEqual(self.events.read_text().splitlines(), barad_run)
-                self.assertTrue(stargate.is_dir())
+            for force in (0, 1):
+                with self.subTest(case=name, force=force):
+                    self.reset()
+                    monitor, stargate = install_monitor(self.root, "usr/local/qcloud", scripts=False)
+                    barad = self.vendor_script(monitor / "barad/admin/uninstall.sh", payload)
+                    sgagent = self.vendor_script(stargate / "admin/uninstall.sh", self.logging_script("sgagent"))
+                    result = self.run_shell(
+                        ROOT_STAT
+                        + EXECUTE
+                        + self.real_function("run")
+                        + LATER_STEPS
+                        + f"FORCE={force}\nuninstall_monitor\n"
+                    )
+                    barad_run = [] if name == "unknown format" else [self.official(barad, "timeout -k 5 120")]
+                    events = self.events.read_text().splitlines()
+                    if force and status < 124:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn(f"Official uninstaller failed ({status}); force mode", result.stderr)
+                        self.assertEqual(self.vendor_log.read_text(), f"sgagent {stargate}/admin\n")
+                        self.assertEqual(
+                            events[: len(barad_run) + 2],
+                            barad_run + [self.official(sgagent, "timeout -k 5 120"), "stop-services stargate"],
+                        )
+                    else:
+                        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                        self.assertFalse(self.vendor_log.exists())
+                        self.assertEqual(events, barad_run)
+                        self.assertTrue(stargate.is_dir())
 
     def test_local_cleanup_removes_each_install_root(self):
         for prefix in ("usr/local/qcloud", "var/lib/qcloud"):
@@ -883,7 +912,7 @@ class ComponentTests(UtsFixture):
                 for status in (124, 137, 143):
                     with self.subTest(component=component, failing=failing, status=status):
                         result = self.run_shell(
-                            "INCLUDE_MONITOR=1\nINCLUDE_TAT=1\n"
+                            "INCLUDE_MONITOR=1\nINCLUDE_TAT=1\nFORCE=1\n"
                             + "remove_cron_lines() { :; }\nremove_system_cron_lines() { :; }\n"
                             + "stop_services() { :; }\nstop_agent_processes() { :; }\n"
                             + "cleanup_services() { :; }\nremove_paths() { record remove; }\n"

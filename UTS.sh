@@ -8,6 +8,7 @@ WORKDIR=""
 COMMAND_TIMEOUT=120
 TIMEOUT_KILL=(-k 5)
 GUARD_WAIT=60
+FORCE=0
 FAILURES=0
 RUN_PID=""
 QUERY_OUTPUT=""
@@ -80,6 +81,8 @@ ${SCRIPT_NAME} ${VERSION}
       --include-monitor    同时卸载云监控（BaradAgent 和 Sgagent）
       --include-tat        同时卸载腾讯云自动化助手（tat_agent）
       --dry-run            只预览将要停止和删除的内容，不做任何修改
+      --force              出错后继续清理：官方卸载程序失败时仍做本地清理，对已确认的
+                           Agent 进程使用 SIGKILL
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
   -h, --help               显示本帮助
 
@@ -107,6 +110,8 @@ Options:
       --include-monitor    Also uninstall Cloud Monitor (BaradAgent and Sgagent)
       --include-tat        Also uninstall TencentCloud Automation Tools (tat_agent)
       --dry-run            Show what would be stopped or removed, change nothing
+      --force              Keep cleaning after failures: clean locally when an official
+                           uninstaller fails and SIGKILL verified agent processes
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
   -h, --help               Show this help message
 
@@ -254,6 +259,7 @@ parse_args() {
       --include-monitor) INCLUDE_MONITOR=1 ;;
       --include-tat) INCLUDE_TAT=1 ;;
       --dry-run) DRY_RUN=1 ;;
+      --force) FORCE=1 ;;
       --timeout)
         [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,3}$ && "$2" -le 3600 ]] \
           || die "--timeout requires 1 to 3600 seconds." "--timeout 需要 1 到 3600 之间的秒数。"
@@ -340,6 +346,17 @@ run_local_script() {
   fi
   log "Running ${description}" "正在运行${description}"
   run sh -c 'cd -- "${1%/*}" && exec "$1"' uts "${script_path}" || rc=$?
+  return "${rc}"
+}
+
+official_step() {
+  local rc=0
+  run_local_script "$@" || rc=$?
+  [[ "${rc}" -ne 0 ]] || return 0
+  if [[ "${FORCE}" -eq 1 && "${rc}" -ne 124 && "${rc}" -lt 128 ]]; then
+    warn "Official uninstaller failed (${rc}); force mode will check and clean remnants." "官方卸载程序失败（${rc}），强制模式将检查并清理残留。"
+    return 0
+  fi
   return "${rc}"
 }
 
@@ -558,6 +575,17 @@ preserved_mask() {
   [[ -L "$1" && "$(readlink -- "$1")" == /dev/null ]]
 }
 
+component_command() {
+  local rc=0
+  run "$@" || rc=$?
+  [[ "${rc}" -ne 0 ]] || return 0
+  if [[ "${FORCE}" -eq 1 && "${rc}" -ne 124 && "${rc}" -lt 128 ]]; then
+    warn "Component command failed; force mode will check and signal verified agent processes." "组件命令失败，强制模式将检查并向已确认的 Agent 进程发送信号。"
+    return 0
+  fi
+  return "${rc}"
+}
+
 unit_stop_hooks() {
   local unit="$1" first="" state="" key="" value="" hooks=""
   QUERY_OUTPUT=""
@@ -636,7 +664,7 @@ stop_services() {
       [[ "${rc}" -eq 0 ]] || state=""
       rc=0
       if [[ "${state}" == *" start/"* ]]; then
-        run initctl stop "${svc}" || return $?
+        component_command initctl stop "${svc}" || return $?
       fi
     fi
   done
@@ -657,7 +685,7 @@ stop_services() {
         state="${QUERY_OUTPUT}"
         state="${state#LoadState=}"
         [[ "${state}" != not-found ]] || continue
-        run systemctl stop "${svc}.${suffix}" || return $?
+        component_command systemctl stop "${svc}.${suffix}" || return $?
         if [[ "${state}" != masked ]]; then
           run systemctl disable "${svc}.${suffix}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
         fi
@@ -921,6 +949,12 @@ stop_agent_processes() {
     [[ -z "${fresh}" ]] || signal_agent_processes TERM "${fresh}"
     signalled="${targets}"
   done
+  if [[ "${FORCE}" -eq 1 ]]; then
+    signal_agent_processes KILL "${targets}"
+    sleep 1
+    targets="$(agent_processes "$@")" || return 1
+    [[ -n "${targets}" ]] || return 0
+  fi
   warn "Agent processes remain; preserving their installation files:" "Agent 进程仍在运行，保留其安装文件："
   show_processes "${targets}"
   return 1
@@ -1216,8 +1250,11 @@ uninstall_yunjing() {
   [[ "${ran}" -eq 1 ]] || log "No official uninst.sh found; cleaning local remnants only." "未找到官方 uninst.sh，仅清理本地残留。"
   if [[ "${official_rc}" -ne 0 ]]; then
     warn "Official uninst.sh exited with status ${official_rc}." "官方 uninst.sh 退出码为 ${official_rc}。"
-    warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
-    return "${official_rc}"
+    if [[ "${FORCE}" -eq 0 || "${official_rc}" -eq 124 || "${official_rc}" -ge 128 ]]; then
+      warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
+      return "${official_rc}"
+    fi
+    warn "Force mode: trying scoped local cleanup." "强制模式：尝试限定范围的本地清理。"
   fi
   if path_present /dev/txyd; then
     if [[ "${DRY_RUN}" -eq 1 && "${ran}" -eq 1 ]]; then
@@ -1256,12 +1293,12 @@ uninstall_monitor() {
   for dir in "${MONITOR_DIRS[@]}"; do
     path="${dir}/barad/admin/uninstall.sh"
     path_present "${path}" || continue
-    run_local_script "${path}" "BaradAgent " "${dir}/barad" || return $?
+    official_step "${path}" "BaradAgent " "${dir}/barad" || return $?
   done
   for dir in "${STARGATE_DIRS[@]}"; do
     path="${dir}/admin/uninstall.sh"
     path_present "${path}" || continue
-    run_local_script "${path}" "Sgagent " "${dir}" || return $?
+    official_step "${path}" "Sgagent " "${dir}" || return $?
   done
   remove_cron_lines /qcloud/stargate/ /qcloud/monitor/barad/ /qcloud/monitor/python26/ || return $?
   remove_system_cron_lines /etc/cron.d/sgagenttask /qcloud/stargate/ || return $?
@@ -1377,11 +1414,14 @@ main() {
   uninstall_yunjing || yunjing_rc=$?
   if [[ "${yunjing_rc}" -ne 0 ]]; then
     component_name yunjing
-    warn "${MSG} uninstall is incomplete (${yunjing_rc}); optional components were not processed." \
-      "${MSG}卸载未完成（${yunjing_rc}），未处理可选组件。"
-    FAILURES=1
-    finish 1
-    exit_status "${yunjing_rc}"
+    if [[ "${FORCE}" -eq 0 ]] || stop_on "${yunjing_rc}"; then
+      warn "${MSG} uninstall is incomplete (${yunjing_rc}); optional components were not processed." \
+        "${MSG}卸载未完成（${yunjing_rc}），未处理可选组件。"
+      FAILURES=1
+      finish 1
+      exit_status "${yunjing_rc}"
+    fi
+    record_failure "${MSG} uninstall is incomplete (${yunjing_rc})." "${MSG}卸载未完成（${yunjing_rc}）。"
   fi
 
   for component in monitor tat; do
@@ -1412,6 +1452,7 @@ main() {
   if [[ "${FAILURES}" -eq 0 && "${verify_rc}" -eq 0 ]]; then
     return 0
   fi
+  [[ "${yunjing_rc}" -ne 6 ]] || return 6
   return 1
 }
 

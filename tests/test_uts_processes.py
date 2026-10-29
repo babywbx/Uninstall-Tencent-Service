@@ -323,13 +323,27 @@ class ProcessTests(UtsFixture):
             "sleep 1",
         ])
 
-    def test_surviving_process_is_reported(self):
+    def test_surviving_process_is_reported_and_only_force_kills(self):
         service = str(self.yunjing / "YDService")
         self.process(900090, service, [service])
-        result = self.run_shell('kill() { record "kill $*"; }\nstop_agent_processes "${YUNJING_DIRS[@]}"\n')
-        self.assertEqual(self.events.read_text().splitlines(), ["kill -TERM 900090"] + ["sleep 1"] * 5)
-        self.assert_failed(result)
-        self.assertIn("Agent processes remain", result.stderr)
+        for force, dies in ((0, False), (1, False), (1, True)):
+            with self.subTest(force=force, dies=dies):
+                exit_on_kill = 'mv "${UTS_TEST_ROOT}/proc/$2" "${UTS_TEST_ROOT}/tmp/exited-$2"' if dies else ":"
+                result = self.run_shell(
+                    'kill() { record "kill $*"; if [[ "$1" == -KILL ]]; then ' + exit_on_kill + "; fi; }\n"
+                    f'FORCE={force}\nstop_agent_processes "${{YUNJING_DIRS[@]}}"\n'
+                )
+                expected = ["kill -TERM 900090"] + ["sleep 1"] * 5
+                if force:
+                    expected += ["kill -KILL 900090", "sleep 1"]
+                self.assertEqual(self.events.read_text().splitlines(), expected)
+                if dies:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("remain", result.stderr)
+                else:
+                    self.assert_failed(result)
+                    self.assertIn("Agent processes remain", result.stderr)
+                    self.assertIn(f"PID 900090   {os.path.realpath(service)}", result.stderr)
 
     def test_dry_run_stop_previews_without_signalling_or_waiting(self):
         service = str(self.yunjing / "YDService")
