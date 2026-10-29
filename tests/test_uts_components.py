@@ -77,6 +77,7 @@ class YunjingTests(UtsFixture):
         cleanup_services() { record "cleanup-services $*"; }
         root_crontab() { :; }
         remove_path() { record "remove $1"; }
+        guard_check() { record guard; }
     """
 
     def setUp(self):
@@ -96,6 +97,7 @@ class YunjingTests(UtsFixture):
             f"stop-processes {self.primary} {self.fallback}",
             "cleanup-services YDService YDLive",
             *self.removals(),
+            "guard",
         ]
 
     def removals(self):
@@ -322,6 +324,34 @@ class YunjingTests(UtsFixture):
         self.assertIn("PID 4242", result.stderr)
         self.assertIn("turn off Agent uninstall protection", result.stderr)
 
+    def test_guard_check_polls_every_five_seconds_for_a_minute(self):
+        self.enable_proc()
+        for dry_run in (0, 1):
+            with self.subTest(dry_run=dry_run):
+                result = self.run_shell(f"DRY_RUN={dry_run}\nguard_check\n")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"] * 12 * (1 - dry_run))
+                self.assertEqual("Watching 60s for uninstall protection" in result.stdout, not dry_run)
+                self.assertEqual(result.stderr, "")
+
+    def test_guard_detects_existing_remnants_on_first_poll(self):
+        self.primary.mkdir(parents=True)
+        result = self.run_shell("guard_check\n")
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"])
+
+    def test_guard_detects_process_reappearing_on_final_check(self):
+        result = self.run_shell(
+            r"""
+            polls=0
+            sleep() { record "sleep $*"; polls=$((polls + 1)); }
+            agent_processes() { [[ "$polls" -lt 12 ]] || printf '4242|agent|1|args\n'; return 0; }
+            guard_check
+            """
+        )
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"] * 12)
+
     def test_dry_run_does_not_run_the_official_uninstaller(self):
         self.vendor_script(self.primary / "uninst.sh", self.logging_script("unexpected"))
         snapshot = self.file_snapshot()
@@ -330,6 +360,93 @@ class YunjingTests(UtsFixture):
         self.assertEqual(self.file_snapshot(), snapshot)
         self.assertFalse(self.vendor_log.exists())
         self.assertNotIn("sleep ", self.events.read_text())
+
+    def test_directory_reappearing_on_third_poll_returns_6(self):
+        self.enable_proc()
+        result = self.run_shell(
+            r"""
+            polls=0
+            sleep() {
+              record "sleep $*"
+              polls=$((polls + 1))
+              [[ "${polls}" -ne 3 ]] || mkdir -p -- "${YUNJING_DIRS[0]}"
+            }
+            guard_check
+            """
+        )
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"] * 3)
+        self.assertIn("Host Security agent files or processes reappeared after removal.", result.stderr)
+        self.assertIn("turn off Agent uninstall protection", result.stderr)
+
+    def test_guard_window_runs_only_when_agent_was_present(self):
+        self.enable_proc()
+        for present in (False, True):
+            with self.subTest(present=present):
+                if present:
+                    self.primary.mkdir(parents=True)
+                result = self.run_shell(
+                    r"""
+                    root_crontab() { :; }
+                    stop_services() { :; }
+                    cleanup_services() { :; }
+                    remove_path() { command rmdir -- "$1" 2>/dev/null || true; }
+                    uninstall_yunjing
+                    """
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual("Watching 60s for uninstall protection" in result.stdout, present)
+                self.assertEqual(self.events.read_text().count("sleep 5"), 12 if present else 0)
+                self.assertFalse(self.primary.exists())
+
+    def test_yunjing_present_detects_directory_or_process(self):
+        self.enable_proc()
+        agent = str(self.primary / "YDService")
+        self.assertEqual(self.run_shell("yunjing_present").returncode, 1)
+        proc = self.process(900001, agent, [agent])
+        self.assertEqual(self.run_shell("yunjing_present").returncode, 0)
+        shutil.rmtree(proc)
+        self.primary.mkdir(parents=True)
+        self.assertEqual(self.run_shell("yunjing_present").returncode, 0)
+
+    def test_process_scan_failure_returns_2(self):
+        with self.subTest(stage="initial"):
+            result = self.run_shell(
+                r"""
+                agent_processes() { record scan-failed; return 1; }
+                stop_services() { record stop; }
+                uninstall_yunjing
+                """
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertEqual(self.events.read_text(), "scan-failed\n")
+        with self.subTest(stage="guard"):
+            (self.primary / "agent").parent.mkdir(parents=True)
+            (self.primary / "agent").touch()
+            self.enable_proc()
+            result = self.run_shell(
+                r"""
+                stat() {
+                  case "$2" in
+                    %u) printf '0\n' ;;
+                    %a) printf '700\n' ;;
+                    *) return 1 ;;
+                  esac
+                }
+                stop_services() { :; }
+                stop_agent_processes() { :; }
+                cleanup_services() { :; }
+                root_crontab() { :; }
+                agent_processes() { record scan-failed; return 1; }
+                run() { record "run $*"; command "$@"; }
+                GUARD_WAIT=60
+                uninstall_yunjing
+                """
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertFalse(self.primary.exists())
+            self.assertIn("scan-failed", self.events.read_text())
+
 
 class MonitorTests(UtsFixture):
     def setUp(self):

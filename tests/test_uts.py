@@ -623,6 +623,44 @@ class MainTests(UtsFixture):
                     self.assertEqual(self.events.read_text().splitlines(), previous[component] + ["service-timeout"])
                     self.assertNotIn("local uninstall verified", result.stdout)
 
+    def test_reappearing_agent_is_reported_as_uninstall_protection(self):
+        primary = self.root / "usr/local/qcloud/YunJing"
+        primary.mkdir(parents=True)
+        result = self.run_shell(
+            r"""
+            stop_services() { :; }
+            stop_agent_processes() { :; }
+            cleanup_services() { :; }
+            remove_cron_lines() { :; }
+            remove_path() { record "remove $1"; }
+            agent_processes() { :; }
+            uninstall_monitor() { record monitor; }
+            uninstall_tat() { record tat; }
+            verify_uninstall() { record verify; }
+            main --yes --include-monitor --include-tat
+            """
+        )
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertIn("reappeared after removal", result.stderr)
+        self.assertIn("turn off Agent uninstall protection", result.stderr)
+        self.assertEqual(
+            self.events.read_text().splitlines(),
+            [
+                *(
+                    f"remove {self.root / path}"
+                    for path in (
+                        "usr/local/qcloud/YunJing",
+                        "var/lib/qcloud/YunJing",
+                        "run/ydeyes",
+                        "var/run/ydeyes",
+                        "tmp/yunjing_install",
+                        "tmp/yunjing_install_nohup",
+                    )
+                ),
+                "sleep 5",
+            ],
+        )
+
     def test_verified_only_when_no_step_or_verification_failed(self):
         for failing in (None, "uninstall_monitor", "uninstall_tat"):
             for verify_rc in (0, 1):

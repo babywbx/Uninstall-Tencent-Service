@@ -7,6 +7,7 @@ readonly VERSION="1.0.0"
 WORKDIR=""
 COMMAND_TIMEOUT=120
 TIMEOUT_KILL=(-k 5)
+GUARD_WAIT=60
 FAILURES=0
 RUN_PID=""
 QUERY_OUTPUT=""
@@ -1164,14 +1165,48 @@ remove_paths() {
   return "${rc}"
 }
 
+yunjing_present() {
+  local dir="" targets=""
+  for dir in "${YUNJING_DIRS[@]}"; do
+    path_present "${dir}" && return 0
+  done
+  targets="$(agent_processes "${YUNJING_DIRS[@]}")" || return 2
+  [[ -n "${targets}" ]]
+}
+
 guard_hint() {
   warn "In the Host Security console, turn off Agent uninstall protection or remove" "请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。"
   warn "this server from its scope, wait about a minute, then run this script again." "约一分钟后重新运行本脚本。"
 }
 
+guard_check() {
+  local waited=0 rc=0
+  [[ "${DRY_RUN}" -eq 0 ]] || return 0
+  log "Watching ${GUARD_WAIT}s for uninstall protection to reinstall the agent." "观察 ${GUARD_WAIT} 秒，确认卸载保护没有重装 Agent。"
+  while ((waited < GUARD_WAIT)); do
+    sleep 5
+    waited=$((waited + 5))
+    if yunjing_present; then
+      warn "Host Security agent files or processes reappeared after removal." "主机安全 Agent 的文件或进程在删除后重新出现。"
+      guard_hint
+      return 6
+    else
+      rc=$?
+      [[ "${rc}" -eq 1 ]] || return "${rc}"
+    fi
+  done
+}
+
 uninstall_yunjing() {
   section "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"
-  local dir="" path="" rc=0 official_rc=0 ran=0
+  local dir="" path="" rc=0 present=0 official_rc=0 ran=0
+  if yunjing_present; then
+    present=1
+  else
+    rc=$?
+    [[ "${rc}" -eq 1 ]] || return "${rc}"
+    rc=0
+  fi
   for dir in "${YUNJING_DIRS[@]}"; do
     path_present "${dir}/uninst.sh" || continue
     ran=1
@@ -1207,6 +1242,9 @@ uninstall_yunjing() {
   remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   remove_paths file "${YUNJING_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   [[ "${rc}" -eq 0 ]] || return 1
+  if [[ "${present}" -eq 1 ]]; then
+    guard_check || return $?
+  fi
 }
 
 uninstall_monitor() {
