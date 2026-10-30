@@ -420,6 +420,7 @@ class MainTests(UtsFixture):
                 self.assertEqual(self.events.read_text().splitlines(), events)
                 self.assertNotIn("Continue?", result.stdout)
                 if code == 1:
+                    self.assertEqual(result.stdout, "")
                     self.assertIn("No terminal for confirmation. Add -y to run unattended.", result.stderr)
 
     def answer(self, reply, mode="stdin"):
@@ -498,7 +499,7 @@ class MainTests(UtsFixture):
             "[ OK ] Uninstall-Tencent-Service: local uninstall verified.",
         ]
         for reply, proceeds in (("y", True), ("yes", True), ("YES", True), ("n", False), ("", False), ("yess", False)):
-            for mode in ("stdin", "stdout"):
+            for mode in ("stdin", "stdout", "devtty"):
                 with self.subTest(reply=reply, mode=mode):
                     result = self.run_shell(self.STUBBED_MAIN + "main --include-tat\n", **self.answer(reply, mode))
                     if mode == "stdout":
@@ -506,7 +507,8 @@ class MainTests(UtsFixture):
                         self.assertIn("\nContinue? [y/N] ", output)
                     else:
                         output = result.stdout
-                        self.assertIn("\nContinue? [y/N] ", output)
+                        self.assertNotIn("Continue?", output)
+                        self.assertEqual(self.terminal_text(), "Continue? [y/N] ")
                     positions = [output.find(line) for line in plan + (summary if proceeds else [])]
                     self.assertNotIn(-1, positions, output)
                     self.assertEqual(positions, sorted(positions))
@@ -533,9 +535,10 @@ class MainTests(UtsFixture):
                 [BASH, "--noprofile", "--norc", "-c", self.shell_body(stubs + "main\n")],
                 cwd=self.base,
                 env=self.shell_environment(),
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
-                **self.answer(None, "stdout"),
+                **self.answer(None),
             )
             try:
                 self.assertIn("Continue? [y/N]", self.terminal_text())

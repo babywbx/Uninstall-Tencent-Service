@@ -292,6 +292,12 @@ parse_args() {
   fi
 }
 
+require_terminal() {
+  [[ "${AUTO_YES}" -eq 0 && "${DRY_RUN}" -eq 0 && ! -t 0 ]] || return 0
+  ( exec </dev/tty ) 2>/dev/null \
+    || die "No terminal for confirmation. Add -y to run unattended." "没有可用于确认的终端，无人值守运行请加 -y。"
+}
+
 component_name() {
   case "$1" in
     yunjing) msg "Host Security agent (YunJing)" "主机安全 Agent（YunJing）" ;;
@@ -393,12 +399,14 @@ show_plan() {
 }
 
 confirm() {
-  local reply=""
+  local reply="" input=/dev/stdin
   [[ "${AUTO_YES}" -eq 0 && "${DRY_RUN}" -eq 0 ]] || return 0
-  [[ -t 0 ]] || die "No terminal for confirmation. Add -y to run unattended." "没有可用于确认的终端，无人值守运行请加 -y。"
+  [[ -t 0 ]] || input=/dev/tty
   msg "Continue? [y/N] " "确认卸载？[y/N] "
-  printf '\n%s%s%s' "${C_BOLD}" "${MSG}" "${C_RESET}"
-  read -r reply || reply=""
+  if [[ -t 1 ]] || ! { printf '%s' "${MSG}" >/dev/tty; } 2>/dev/null; then
+    printf '\n%s%s%s' "${C_BOLD}" "${MSG}" "${C_RESET}"
+  fi
+  read -r reply <"${input}" || reply=""
   case "${reply}" in
     y|Y|yes|Yes|YES) ;;
     *) die "Canceled; nothing was changed." "已取消，未做任何修改。" ;;
@@ -1748,6 +1756,7 @@ main() {
 
   exec 3>&1
   parse_args "$@"
+  require_terminal
   require_linux
   require_root
   detect_distro
