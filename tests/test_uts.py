@@ -30,7 +30,7 @@ stat() {
 EXECUTE = 'timeout() { record "timeout $*"; shift 3; "$@"; }\n'
 CJK = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 MESSAGE_CALL = re.compile(
-    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|preview|section|record_failure)'
+    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|preview|section|step|record_failure)'
     r'\s+("[^"]*")((?:\s+"[^"]*")*)'
 )
 
@@ -386,9 +386,12 @@ class MainTests(UtsFixture):
         self.assertNotIn(-1, positions, result.stdout)
         self.assertEqual(positions[:3], sorted(positions[:3]))
         steps = [
-            "==> Host Security agent (YunJing)",
-            "==> Cloud Monitor (BaradAgent / Sgagent)",
-            "==> TencentCloud Automation Tools (tat_agent)",
+            "==> [1/3] Host Security agent (YunJing)",
+            "==> [2/3] Cloud Monitor (BaradAgent / Sgagent)",
+            "==> [3/3] TencentCloud Automation Tools (tat_agent)",
+            "[ OK ] Host Security agent (YunJing): previewed",
+            "[ OK ] Cloud Monitor (BaradAgent / Sgagent): previewed",
+            "[ OK ] TencentCloud Automation Tools (tat_agent): previewed",
             "[ OK ] Dry run finished; nothing was changed.",
         ]
         positions = [result.stdout.find(line) for line in steps]
@@ -401,9 +404,9 @@ class MainTests(UtsFixture):
         self.assertEqual(before, self.file_snapshot())
 
     STUBBED_MAIN = r"""
-        uninstall_yunjing() { section "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"; record yunjing; }
+        uninstall_yunjing() { step "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"; record yunjing; }
         uninstall_monitor() { record monitor; }
-        uninstall_tat() { section "TencentCloud Automation Tools (tat_agent)" "腾讯云自动化助手（tat_agent）"; record tat; }
+        uninstall_tat() { step "TencentCloud Automation Tools (tat_agent)" "腾讯云自动化助手（tat_agent）"; record tat; }
         verify_uninstall() { record verify; }
     """
 
@@ -492,10 +495,14 @@ class MainTests(UtsFixture):
             "  To preview without changes, run again with --dry-run.",
         ]
         summary = [
-            "==> Host Security agent (YunJing)",
-            "==> TencentCloud Automation Tools (tat_agent)",
-            "==> Verification",
+            "==> [1/3] Host Security agent (YunJing)",
+            "==> [2/3] TencentCloud Automation Tools (tat_agent)",
+            "==> [3/3] Verification",
             "[ OK ] No agent files, processes, services or cron entries remain.",
+            "==> Summary",
+            "[ OK ] Host Security agent (YunJing): uninstalled",
+            "[SKIP] Cloud Monitor (BaradAgent / Sgagent): kept, not selected",
+            "[ OK ] TencentCloud Automation Tools (tat_agent): not installed, remnants checked",
             "[ OK ] Uninstall-Tencent-Service: local uninstall verified.",
         ]
         for reply, proceeds in (("y", True), ("yes", True), ("YES", True), ("n", False), ("", False), ("yess", False)):
@@ -519,7 +526,7 @@ class MainTests(UtsFixture):
                         self.assertEqual(result.returncode, 1, output + result.stderr)
                         self.assertEqual(self.events.read_text(), "")
                         self.assertIn("Canceled; nothing was changed.", result.stderr)
-                        self.assertNotIn("==> Host Security agent", output)
+                        self.assertNotIn("==> [1/", output)
 
     def test_ctrl_c_at_the_prompt_changes_nothing(self):
         mask_state = self.root / "var/lib/uts/created-masks"
@@ -549,7 +556,7 @@ class MainTests(UtsFixture):
                     process.kill()
                     process.communicate()
             self.assertEqual(process.returncode, 130, stderr.decode())
-            self.assertIn("Interrupted; run the script again to finish the cleanup.", stderr.decode())
+            self.assertIn("Interrupted; nothing was changed.", stderr.decode())
             self.assertEqual(self.events.read_text(), "")
             self.assertEqual(mask_state.read_text(), "/etc/systemd/system/gone.service\n")
         result = self.run_shell(stubs + "main\n", **self.answer("y"))
@@ -585,8 +592,15 @@ class MainTests(UtsFixture):
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertNotIn("Dry run finished", result.stdout)
-        self.assertIn("TencentCloud Automation Tools (tat_agent) uninstall is incomplete (1).", result.stderr)
+        self.assertIn("[FAIL] TencentCloud Automation Tools (tat_agent): incomplete (exit 1)", result.stdout)
         self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
+
+    def test_interrupt_message_says_whether_anything_changed(self):
+        for step, message in ((0, "Interrupted; nothing was changed."), (2, "run the script again to finish the cleanup")):
+            with self.subTest(step=step):
+                result = self.run_shell(f"STEP={step}\ninterrupt 130\n")
+                self.assertEqual(result.returncode, 130, result.stderr)
+                self.assertIn(message, result.stderr)
 
     def test_chinese_output_has_no_untranslated_lines(self):
         (self.root / "usr/local/qcloud/stargate").mkdir(parents=True)
@@ -594,7 +608,7 @@ class MainTests(UtsFixture):
             with self.subTest(language=language):
                 result = self.run_shell(
                     self.STUBBED_MAIN
-                    + 'uninstall_monitor() { section "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"; return 1; }\n'
+                    + 'uninstall_monitor() { step "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"; return 1; }\n'
                     + "verify_uninstall() { warn \"Agent processes remain:\" \"仍有 Agent 进程：\"; return 1; }\n"
                     + f"UI_LANG={language}\nmain --yes --force --include-monitor --include-tat\n"
                 )
@@ -606,7 +620,7 @@ class MainTests(UtsFixture):
                     self.assertEqual(lines, english)
                 else:
                     self.assertEqual(english, ["Uninstall-Tencent-Service 1.0.0"], result.stdout + result.stderr)
-                    self.assertIn("云监控（BaradAgent / Sgagent）卸载未完成（1）。", result.stderr)
+                    self.assertIn("[FAIL] 云监控（BaradAgent / Sgagent）：未完成（退出码 1）", result.stdout)
                     self.assertIn("Uninstall-Tencent-Service：未完成", result.stderr)
 
     def test_yunjing_status_controls_optional_components(self):
@@ -636,6 +650,8 @@ class MainTests(UtsFixture):
                 self.assertIn(f"Host Security agent (YunJing) uninstall is incomplete ({status})", result.stderr)
                 self.assertEqual("optional components were not processed" in result.stderr, not continued)
                 self.assertNotIn("local uninstall verified", result.stdout)
+                self.assertIn(f"[FAIL] Host Security agent (YunJing): incomplete (exit {status})", result.stdout)
+                self.assertEqual(result.stdout.count(": not processed"), 0 if continued else 2)
                 self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
 
     def test_optional_component_timeout_stops_remaining_work(self):
@@ -656,7 +672,8 @@ class MainTests(UtsFixture):
                         ["monitor"] if component == "monitor" else ["monitor", "tat"],
                     )
                     self.assertNotIn("local uninstall verified", result.stdout)
-                    self.assertIn(f"uninstall is incomplete ({status})", result.stderr)
+                    self.assertIn(f": incomplete (exit {status})", result.stdout)
+                    self.assertEqual(": not processed" in result.stdout, component == "monitor")
                     self.assertIn("Uninstall-Tencent-Service: incomplete.", result.stderr)
 
     def test_service_timeout_is_preserved_through_real_component_and_main(self):

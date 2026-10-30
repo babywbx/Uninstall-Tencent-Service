@@ -173,7 +173,7 @@ class InterruptTests(UtsFixture):
             + f"WORKDIR={shlex.quote(str(workdir))}\n"
             + 'mkdir "$WORKDIR"\n'
             + "trap cleanup EXIT\ntrap 'interrupt 143' TERM\n"
-            + "COMMAND_TIMEOUT=6\n"
+            + "COMMAND_TIMEOUT=6\nSTEP=1\n"
             + ("TIMEOUT_KILL=(-k 1)\n" if kill_after else "TIMEOUT_KILL=(-s KILL)\n")
         )
         if query:

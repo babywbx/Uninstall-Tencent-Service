@@ -41,6 +41,12 @@ INCLUDE_TAT=0
 DRY_RUN=0
 UI_LANG=zh
 MSG=""
+STEP=0
+STEPS=0
+INSTALLED=" "
+RC_YUNJING=""
+RC_MONITOR=""
+RC_TAT=""
 
 DISTRO_PRETTY="unknown"
 
@@ -67,7 +73,11 @@ interrupt() {
     kill "-${stop_signal}" "${RUN_PID}" 2>/dev/null || true
     wait "${RUN_PID}" 2>/dev/null || true
   fi
-  warn "Interrupted; run the script again to finish the cleanup." "已中断，重新运行本脚本即可继续清理。" || true
+  if [[ "${STEP}" -eq 0 ]]; then
+    warn "Interrupted; nothing was changed." "已中断，未做任何修改。" || true
+  else
+    warn "Interrupted; run the script again to finish the cleanup." "已中断，重新运行本脚本即可继续清理。" || true
+  fi
   exit "$1"
 }
 
@@ -169,6 +179,13 @@ preview() {
 section() {
   msg "$@"
   printf '\n%s==>%s %s%s%s\n' "${C_BOLD}${C_BLUE}" "${C_RESET}" "${C_BOLD}" "${MSG}" "${C_RESET}"
+}
+
+step() {
+  STEP=$((STEP + 1))
+  msg "$@"
+  [[ "${STEPS}" -eq 0 ]] || MSG="[${STEP}/${STEPS}] ${MSG}"
+  section "${MSG}"
 }
 
 command_exists() {
@@ -335,6 +352,10 @@ row() {
   printf '  %s%-8s%s %s\n' "$1" "$2" "${C_RESET}" "$3"
 }
 
+report() {
+  printf '%s%s%s %s\n' "$1" "$2" "${C_RESET}" "${MSG}"
+}
+
 show_plan() {
   local component="" flag="" name="" mode="" arch="" indent='           '
   [[ "${UI_LANG}" != zh ]] || indent='         '
@@ -357,6 +378,7 @@ show_plan() {
     name="${MSG}"
     flag="--include-${component}"
     if component_installed "${component}"; then
+      INSTALLED+="${component} "
       if component_selected "${component}"; then
         msg "[remove]" "[卸载]"; row "${C_RED}" "${MSG}" "${name}"
       else
@@ -1580,7 +1602,7 @@ guard_check() {
 }
 
 uninstall_yunjing() {
-  section "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"
+  step "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"
   local dir="" path="" rc=0 present=0 official_rc=0 ran=0
   if yunjing_present; then
     present=1
@@ -1635,7 +1657,7 @@ uninstall_yunjing() {
 
 uninstall_monitor() {
   [[ "${INCLUDE_MONITOR}" -eq 1 ]] || return 0
-  section "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"
+  step "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"
   local dir="" path="" rc=0
   local -a removals=()
   while IFS= read -r path; do removals+=("${path}"); done < <(monitor_targets)
@@ -1670,7 +1692,7 @@ uninstall_monitor() {
 
 uninstall_tat() {
   [[ "${INCLUDE_TAT}" -eq 1 ]] || return 0
-  section "TencentCloud Automation Tools (tat_agent)" "腾讯云自动化助手（tat_agent）"
+  step "TencentCloud Automation Tools (tat_agent)" "腾讯云自动化助手（tat_agent）"
   local dir="" path="" rc=0
   remove_cron_lines /qcloud/tat_agent/ || return $?
   stop_services "${TAT_SERVICES[@]}" || return $?
@@ -1727,8 +1749,42 @@ verify_uninstall() {
   return "${found}"
 }
 
+component_result() {
+  local component="$1" rc="$2" name="" installed=0
+  component_name "${component}"
+  name="${MSG}"
+  [[ "${INSTALLED}" != *" ${component} "* ]] || installed=1
+  if ! component_selected "${component}"; then
+    if [[ "${installed}" -eq 1 ]]; then
+      msg "${name}: kept, not selected" "${name}：已保留，未选择"
+    else
+      msg "${name}: not installed" "${name}：未安装"
+    fi
+    report "${C_DIM}" "[SKIP]"
+  elif [[ -z "${rc}" ]]; then
+    msg "${name}: not processed" "${name}：未处理"
+    report "${C_DIM}" "[SKIP]"
+  elif [[ "${rc}" -ne 0 ]]; then
+    msg "${name}: incomplete (exit ${rc})" "${name}：未完成（退出码 ${rc}）"
+    report "${C_RED}" "[FAIL]"
+  else
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      msg "${name}: previewed" "${name}：已预览"
+    elif [[ "${installed}" -eq 1 ]]; then
+      msg "${name}: uninstalled" "${name}：已卸载"
+    else
+      msg "${name}: not installed, remnants checked" "${name}：未安装，残留已检查"
+    fi
+    report "${C_GREEN}" "[ OK ]"
+  fi
+}
+
 finish() {
   local verify_rc="$1"
+  section "Summary" "结果汇总"
+  component_result yunjing "${RC_YUNJING}"
+  component_result monitor "${RC_MONITOR}"
+  component_result tat "${RC_TAT}"
   printf '\n'
   if [[ "${DRY_RUN}" -eq 1 && "${FAILURES}" -eq 0 ]]; then
     ok "Dry run finished; nothing was changed." "预览完成，未做任何修改。"
@@ -1752,7 +1808,7 @@ exit_status() {
 }
 
 main() {
-  local component="" verify_rc=0 rc=0 yunjing_rc=0
+  local component="" verify_rc=0 rc=0
 
   exec 3>&1
   parse_args "$@"
@@ -1768,26 +1824,28 @@ main() {
   show_plan
   confirm
   prune_mask_state || die "Cannot update ${MASK_STATE}. No uninstall was attempted." "无法更新 ${MASK_STATE}，未执行任何卸载。"
+  STEPS=$((1 + INCLUDE_MONITOR + INCLUDE_TAT + 1 - DRY_RUN))
 
-  uninstall_yunjing || yunjing_rc=$?
-  if [[ "${yunjing_rc}" -ne 0 ]]; then
+  RC_YUNJING=0
+  uninstall_yunjing || RC_YUNJING=$?
+  if [[ "${RC_YUNJING}" -ne 0 ]]; then
     component_name yunjing
-    if [[ "${FORCE}" -eq 0 ]] || stop_on "${yunjing_rc}"; then
-      warn "${MSG} uninstall is incomplete (${yunjing_rc}); optional components were not processed." \
-        "${MSG}卸载未完成（${yunjing_rc}），未处理可选组件。"
+    if [[ "${FORCE}" -eq 0 ]] || stop_on "${RC_YUNJING}"; then
+      warn "${MSG} uninstall is incomplete (${RC_YUNJING}); optional components were not processed." \
+        "${MSG}卸载未完成（${RC_YUNJING}），未处理可选组件。"
       FAILURES=1
       finish 1
-      exit_status "${yunjing_rc}"
+      exit_status "${RC_YUNJING}"
     fi
-    record_failure "${MSG} uninstall is incomplete (${yunjing_rc})." "${MSG}卸载未完成（${yunjing_rc}）。"
+    record_failure "${MSG} uninstall is incomplete (${RC_YUNJING})." "${MSG}卸载未完成（${RC_YUNJING}）。"
   fi
 
   for component in monitor tat; do
     component_selected "${component}" || continue
     rc=0
     case "${component}" in
-      monitor) uninstall_monitor || rc=$? ;;
-      tat) uninstall_tat || rc=$? ;;
+      monitor) uninstall_monitor || rc=$?; RC_MONITOR="${rc}" ;;
+      tat) uninstall_tat || rc=$?; RC_TAT="${rc}" ;;
     esac
     [[ "${rc}" -ne 0 ]] || continue
     component_name "${component}"
@@ -1799,7 +1857,7 @@ main() {
   done
 
   if [[ "${DRY_RUN}" -eq 0 ]]; then
-    section "Verification" "验证"
+    step "Verification" "验证"
     if verify_uninstall; then
       ok "No agent files, processes, services or cron entries remain." "未发现 Agent 文件、进程、服务或定时任务残留。"
     else
@@ -1810,7 +1868,7 @@ main() {
   if [[ "${FAILURES}" -eq 0 && "${verify_rc}" -eq 0 ]]; then
     return 0
   fi
-  [[ "${yunjing_rc}" -ne 6 ]] || return 6
+  [[ "${RC_YUNJING}" -ne 6 ]] || return 6
   return 1
 }
 
