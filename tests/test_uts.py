@@ -728,6 +728,7 @@ class MainTests(UtsFixture):
             cleanup_services() { :; }
             remove_cron_lines() { :; }
             remove_path() { record "remove $1"; }
+            yunjing_installer_dirs() { printf '%s\n' "$UTS_TEST_ROOT/tmp/0123456789abcdef0123456789abcdef"; }
             agent_processes() { :; }
             uninstall_monitor() { record monitor; }
             uninstall_tat() { record tat; }
@@ -748,8 +749,13 @@ class MainTests(UtsFixture):
                         "var/lib/qcloud/YunJing",
                         "run/ydeyes",
                         "var/run/ydeyes",
+                        "var/cache/ydeyes",
+                        "tmp/0123456789abcdef0123456789abcdef",
                         "tmp/yunjing_install",
                         "tmp/yunjing_install_nohup",
+                        "tmp/ydeye_install.log",
+                        "var/run/YDService.pid",
+                        "var/run/YDLive.pid",
                     )
                 ),
                 "sleep 5",

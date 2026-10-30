@@ -109,8 +109,12 @@ class YunjingTests(UtsFixture):
             self.fallback,
             self.root / "run/ydeyes",
             self.root / "var/run/ydeyes",
+            self.root / "var/cache/ydeyes",
             self.root / "tmp/yunjing_install",
             self.root / "tmp/yunjing_install_nohup",
+            self.root / "tmp/ydeye_install.log",
+            self.root / "var/run/YDService.pid",
+            self.root / "var/run/YDLive.pid",
         )
         return [f"remove {path}" for path in paths]
 
@@ -260,6 +264,49 @@ class YunjingTests(UtsFixture):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertFalse(self.vendor_log.exists())
                 self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
+
+    def test_installer_download_dirs_are_removed_only_when_they_match(self):
+        tmp = self.root / "tmp"
+        (tmp / "ydeye_install.log").write_text("install finish\n")
+        cases = {
+            "1f88b16d145d24dffb5bb86e5bfeed14": ("package", 0, "0", True),
+            "2af7c071b686bc94776078e2ebe35b8a": ("empty", 300, "0", True),
+            "0123456789abcdef0123456789abcdef": ("empty", 3600, "0", False),
+            "fedcba9876543210fedcba9876543210": ("package", 0, "1000", False),
+            "abcdefabcdefabcdefabcdefabcdefab": ("other", 0, "0", False),
+            "not-a-digest-1f88b16d145d24dffb": ("package", 0, "0", False),
+        }
+        lines = ['    */ydeye_install.log) mtime=100000 ;;']
+        for name, (content, age, owner, _) in cases.items():
+            directory = tmp / name
+            directory.mkdir()
+            if content == "package":
+                (directory / "ydeyesinst_linux64.tar.gz").write_bytes(b"pkg")
+                (directory / "self_cloud_install_linux64.sh").write_text("#!/bin/sh\n")
+            elif content == "other":
+                (directory / "data.bin").write_bytes(b"x")
+            lines.append(f"    */{name}) owner={owner}; mtime={100000 - age} ;;")
+        stat_stub = (
+            "stat() {\n"
+            + "  local owner=0 mtime=\n"
+            + '  case "${@: -1}" in\n'
+            + "\n".join(lines)
+            + "\n  esac\n"
+            + '  case "$2" in\n'
+            + "    %u) printf '%s\\n' \"$owner\" ;;\n"
+            + "    %a) printf '700\\n' ;;\n"
+            + '    %Y) [[ -n "$mtime" ]] && printf \'%s\\n\' "$mtime" ;;\n'
+            + "    *) return 1 ;;\n"
+            + "  esac\n"
+            + "}\n"
+        )
+        result = self.run_shell(stat_stub + "yunjing_installer_dirs\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = sorted(f"{tmp}/{name}" for name, case in cases.items() if case[3])
+        self.assertEqual(sorted(result.stdout.splitlines()), expected)
+        (tmp / "ydeye_install.log").unlink()
+        result = self.run_shell(stat_stub + "yunjing_installer_dirs\n")
+        self.assertEqual(result.stdout, f"{tmp}/1f88b16d145d24dffb5bb86e5bfeed14\n")
 
     def test_kernel_protection_blocks_cleanup_after_official_uninstaller(self):
         self.enable_proc()
@@ -1029,6 +1076,7 @@ class ComponentTests(UtsFixture):
             self.root / "var/lib/qcloud/YunJing",
             self.root / "run/ydeyes",
             self.root / "var/run/ydeyes",
+            self.root / "var/cache/ydeyes",
         ]
         monitor_dirs = [
             self.root / "usr/local/qcloud/stargate",
@@ -1045,6 +1093,9 @@ class ComponentTests(UtsFixture):
         yunjing_leftovers = [
             self.root / "tmp/yunjing_install",
             self.root / "tmp/yunjing_install_nohup",
+            self.root / "tmp/ydeye_install.log",
+            self.root / "var/run/YDService.pid",
+            self.root / "var/run/YDLive.pid",
         ]
         monitor_leftovers = [
             self.root / "tmp/stargate.lock",

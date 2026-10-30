@@ -20,8 +20,8 @@ LOCK_DIR="/run/uts.lock"
 PROC_ROOT="/proc"
 BACKUP_ROOT="/var/backups"
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
-YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes)
-YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup)
+YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes /var/cache/ydeyes)
+YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup /tmp/ydeye_install.log /var/run/YDService.pid /var/run/YDLive.pid)
 STARGATE_DIRS=(/usr/local/qcloud/stargate /var/lib/qcloud/stargate)
 MONITOR_DIRS=(/usr/local/qcloud/monitor /var/lib/qcloud/monitor)
 MONITOR_FILES=(/tmp/stargate.lock /usr/bin/cagent_tools /opt/bin/cagent_tools /var/run/stargate.tencentyun.pid
@@ -552,6 +552,33 @@ selected_cron_patterns() {
   if [[ "${INCLUDE_TAT}" -eq 1 ]]; then
     printf '%s\n' /qcloud/tat_agent/
   fi
+}
+
+yunjing_installer_dirs() {
+  local dir="" anchor="" stamp="" when="" near=0
+  local -a stamps=()
+  for anchor in /tmp/ydeye_install.log /tmp/yunjing_install; do
+    [[ -f "${anchor}" && ! -L "${anchor}" ]] || continue
+    stamp="$(stat -c %Y "${anchor}" 2>/dev/null)" || continue
+    [[ ! "${stamp}" =~ ^[0-9]+$ ]] || stamps+=("${stamp}")
+  done
+  for dir in /tmp/*; do
+    [[ "${dir##*/}" =~ ^[0-9a-f]{32}$ && -d "${dir}" && ! -L "${dir}" ]] || continue
+    root_owned_private "${dir}" || continue
+    if [[ -f "${dir}/ydeyesinst_linux64.tar.gz" && -f "${dir}/self_cloud_install_linux64.sh" ]]; then
+      printf '%s\n' "${dir}"
+      continue
+    fi
+    [[ -z "$(find "${dir}" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -n 1)" ]] || continue
+    when="$(stat -c %Y "${dir}" 2>/dev/null)" || continue
+    [[ "${when}" =~ ^[0-9]+$ ]] || continue
+    near=0
+    for stamp in ${stamps[@]+"${stamps[@]}"}; do
+      if (( when - stamp <= 900 && stamp - when <= 900 )); then near=1; fi
+    done
+    [[ "${near}" -eq 0 ]] || printf '%s\n' "${dir}"
+  done
+  return 0
 }
 
 selected_leftovers() {
@@ -1631,6 +1658,7 @@ guard_check() {
 uninstall_yunjing() {
   step "Host Security agent (YunJing)" "主机安全 Agent（YunJing）"
   local dir="" path="" rc=0 present=0 official_rc=0 ran=0
+  local -a installers=()
   if yunjing_present; then
     present=1
   else
@@ -1673,7 +1701,8 @@ uninstall_yunjing() {
     return 6
   fi
   cleanup_services "${YUNJING_SERVICES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
-  remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
+  while IFS= read -r path; do installers+=("${path}"); done < <(yunjing_installer_dirs)
+  remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" ${installers[@]+"${installers[@]}"} || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   remove_paths file "${YUNJING_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   [[ "${rc}" -eq 0 ]] || return 1
   if [[ "${present}" -eq 1 ]]; then
