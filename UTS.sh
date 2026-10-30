@@ -104,6 +104,7 @@ ${SCRIPT_NAME} ${VERSION}
                            /var/backups），并修复阻止删除的文件属性
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
       --lang zh|en         输出语言（默认 zh）
+  -V, --version            显示版本
   -h, --help               显示本帮助
 
 主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再停止、
@@ -114,6 +115,7 @@ VNC 等无法显示中文的终端请加 --lang en。
 退出码：
   0         卸载已验证，或预览完成
   1         有步骤失败、仍有残留，或运行被拒绝、取消
+  2         用法错误，未做任何修改
   6         因卸载保护、内核保护或进程无法停止，主机安全 Agent 未被卸载
   124、137  命令超时被终止
   130、143  被中断
@@ -137,6 +139,7 @@ Options:
                            repair blocking file attributes
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
       --lang zh|en         Output language (default: zh)
+  -V, --version            Show the version
   -h, --help               Show this help message
 
 Host Security (YunJing) is always uninstalled. Runs the official uninstallers found
@@ -147,6 +150,7 @@ Disable Agent uninstall protection in the Host Security console before running.
 Exit status:
   0         uninstall verified, or dry run finished
   1         a step failed, remnants remain, or the run was refused or canceled
+  2         invalid usage; nothing was changed
   6         uninstall protection, kernel protection or an unstoppable process kept Host Security
   124, 137  a command timed out and was stopped
   130, 143  interrupted
@@ -167,6 +171,14 @@ die() {
   msg "$@"
   printf '%s[FAIL]%s %s\n' "${C_RED}" "${C_RESET}" "${MSG}" >&2
   exit 1
+}
+
+usage_error() {
+  msg "$@"
+  printf '%s[FAIL]%s %s\n' "${C_RED}" "${C_RESET}" "${MSG}" >&2
+  msg "Run with --help for usage." "使用 --help 查看用法。"
+  printf '%s\n' "${MSG}" >&2
+  exit 2
 }
 
 ok() {
@@ -301,16 +313,20 @@ parse_args() {
       --force) FORCE=1 ;;
       --timeout)
         [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,3}$ && "$2" -le 3600 ]] \
-          || die "--timeout requires 1 to 3600 seconds." "--timeout 需要 1 到 3600 之间的秒数。"
+          || usage_error "--timeout requires 1 to 3600 seconds." "--timeout 需要 1 到 3600 之间的秒数。"
         COMMAND_TIMEOUT="$2"
         shift
         ;;
       --lang)
-        [[ $# -ge 2 && ( "$2" == en || "$2" == zh ) ]] || die "--lang requires zh or en." "--lang 只能是 zh 或 en。"
+        [[ $# -ge 2 && ( "$2" == en || "$2" == zh ) ]] || usage_error "--lang requires zh or en." "--lang 只能是 zh 或 en。"
         shift
         ;;
+      -V|--version)
+        printf '%s %s\n' "${SCRIPT_NAME}" "${VERSION}"
+        exit 0
+        ;;
       -h|--help) help=1 ;;
-      *) die "Unknown option: $1" "未知选项：$1" ;;
+      *) usage_error "Unknown option: $1" "未知选项：$1" ;;
     esac
     shift
   done
@@ -323,7 +339,7 @@ parse_args() {
 require_terminal() {
   [[ "${AUTO_YES}" -eq 0 && "${DRY_RUN}" -eq 0 && ! -t 0 ]] || return 0
   ( exec </dev/tty ) 2>/dev/null \
-    || die "No terminal for confirmation. Add -y to run unattended." "没有可用于确认的终端，无人值守运行请加 -y。"
+    || usage_error "No terminal for confirmation. Add -y to run unattended." "没有可用于确认的终端，无人值守运行请加 -y。"
 }
 
 component_name() {

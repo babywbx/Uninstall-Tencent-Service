@@ -30,7 +30,7 @@ stat() {
 EXECUTE = 'timeout() { record "timeout $*"; shift 3; "$@"; }\n'
 CJK = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 MESSAGE_CALL = re.compile(
-    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|preview|section|step|record_failure)'
+    r'(?:^|[\s;{(|&])(log|warn|die|ok|msg|preview|section|step|usage_error|record_failure)'
     r'\s+("[^"]*")((?:\s+"[^"]*")*)'
 )
 
@@ -238,20 +238,21 @@ class MainTests(UtsFixture):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, f"{accepted}\n")
                 else:
-                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertEqual(result.stdout, "")
                     self.assertIn("[FAIL]", result.stderr)
+                    self.assertIn("Run with --help for usage.", result.stderr)
         for arguments, message in (
             ("--bogus --lang zh", "[FAIL] 未知选项：--bogus"),
-            ("--timeout 0 --lang zh", "[FAIL] --timeout 需要 1 到 3600 之间的秒数。"),
+            ("--timeout 0 --lang zh", "使用 --help 查看用法。"),
             ("--lang zh --bogus --lang en", "[FAIL] Unknown option: --bogus"),
         ):
             with self.subTest(arguments=arguments):
                 result = self.run_shell(f"parse_args {arguments}\n")
-                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(message, result.stderr)
 
-    def test_help_follows_the_selected_language(self):
+    def test_help_and_version_follow_the_selected_language(self):
         def invoke(arguments, **environment):
             return subprocess.run(
                 [BASH, str(SCRIPT), *arguments],
@@ -280,11 +281,16 @@ class MainTests(UtsFixture):
         english = invoke(["--help", "--lang", "en"]).stdout
         chinese = invoke(["--help"]).stdout
         options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
-        self.assertGreaterEqual(len(options), 8)
+        self.assertGreaterEqual(len(options), 9)
         self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
-        for code in ("0", "1", "6", "124, 137", "130, 143"):
+        for code in ("0", "1", "2", "6", "124, 137", "130, 143"):
             self.assertRegex(english, rf"(?m)^  {code}\s+\w")
             self.assertRegex(chinese, rf"(?m)^  {code.replace(', ', '、')}\s+\S")
+        for arguments in (["--version"], ["-V", "--bogus"], ["--lang", "zh", "--version"]):
+            with self.subTest(arguments=arguments):
+                result = invoke(arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "Uninstall-Tencent-Service 1.0.0\n")
 
     def test_every_message_has_an_english_and_a_chinese_text(self):
         source = re.sub(r"\\\n\s*", " ", SCRIPT.read_text())
@@ -423,8 +429,8 @@ class MainTests(UtsFixture):
 
     def test_confirmation_needs_a_terminal_unless_yes_or_dry_run(self):
         for options, code, events in (
-            ("", 1, []),
-            ("--force --include-tat", 1, []),
+            ("", 2, []),
+            ("--force --include-tat", 2, []),
             ("--yes", 0, ["yunjing", "verify"]),
             ("--dry-run", 0, ["yunjing"]),
         ):
@@ -433,7 +439,7 @@ class MainTests(UtsFixture):
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
                 self.assertEqual(self.events.read_text().splitlines(), events)
                 self.assertNotIn("Continue?", result.stdout)
-                if code == 1:
+                if code == 2:
                     self.assertEqual(result.stdout, "")
                     self.assertIn("No terminal for confirmation. Add -y to run unattended.", result.stderr)
 
