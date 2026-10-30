@@ -60,9 +60,11 @@ cleanup() {
 }
 
 interrupt() {
+  local stop_signal=TERM
   trap '' INT TERM
   if [[ -n "${RUN_PID}" ]]; then
-    kill -TERM "${RUN_PID}" 2>/dev/null || true
+    [[ "${TIMEOUT_KILL[0]}" != -s ]] || stop_signal=ALRM
+    kill "-${stop_signal}" "${RUN_PID}" 2>/dev/null || true
     wait "${RUN_PID}" 2>/dev/null || true
   fi
   warn "Interrupted; run the script again to finish the cleanup." "已中断，重新运行本脚本即可继续清理。" || true
@@ -224,7 +226,11 @@ prepare_runtime() {
   for tool in awk readlink stat grep cksum find timeout flock; do
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
-  timeout -k 1 1 true 2>/dev/null || die "GNU timeout with -k is required. Install coreutils." "需要支持 -k 的 GNU timeout，请安装 coreutils。"
+  if ! timeout -k 1 1 true 2>/dev/null; then
+    timeout -s KILL 1 true || die "GNU timeout is required. Install coreutils." "需要 GNU timeout，请安装 coreutils。"
+    TIMEOUT_KILL=(-s KILL)
+    warn "timeout lacks -k; commands still running at the deadline receive SIGKILL." "timeout 不支持 -k，到时仍在运行的命令会直接收到 SIGKILL。"
+  fi
   [[ -r "${PROC_ROOT}/self/mountinfo" && -r "${PROC_ROOT}/self/status" ]] || die "A readable Linux /proc is required." "需要可读的 Linux /proc。"
   [[ "${DRY_RUN}" -eq 0 ]] || return 0
   [[ -d /run ]] || LOCK_DIR="/var/run/uts.lock"

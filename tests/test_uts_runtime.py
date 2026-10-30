@@ -148,10 +148,13 @@ class InterruptTests(UtsFixture):
     def test_interrupt_stops_service_query_without_waiting_for_deadline(self):
         self.check_interrupt_cleanup(query=True)
 
+    def test_interrupt_stops_child_with_timeout_kill_fallback(self):
+        self.check_interrupt_cleanup(kill_after=False)
+
     def test_interrupt_stops_root_crontab_query_without_waiting_for_deadline(self):
         self.check_interrupt_cleanup(query="crontab")
 
-    def check_interrupt_cleanup(self, query=False):
+    def check_interrupt_cleanup(self, query=False, kill_after=True):
         binaries = self.base / "bin"
         binaries.mkdir()
         timeout_pid = self.base / "timeout.pid"
@@ -171,7 +174,7 @@ class InterruptTests(UtsFixture):
             + 'mkdir "$WORKDIR"\n'
             + "trap cleanup EXIT\ntrap 'interrupt 143' TERM\n"
             + "COMMAND_TIMEOUT=6\n"
-            + "TIMEOUT_KILL=(-k 1)\n"
+            + ("TIMEOUT_KILL=(-k 1)\n" if kill_after else "TIMEOUT_KILL=(-s KILL)\n")
         )
         if query:
             self.vendor_script(

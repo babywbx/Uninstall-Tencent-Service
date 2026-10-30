@@ -310,6 +310,35 @@ class MainTests(UtsFixture):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, f"{expected}\n")
 
+    def test_timeout_without_kill_after_falls_back_to_sigkill(self):
+        self.enable_proc()
+        for supports_k, expected in ((1, "timeout -k 5 120 true"), (0, "timeout -s KILL 120 true")):
+            with self.subTest(supports_k=supports_k):
+                result = self.run_shell(
+                    self.real_function("prepare_runtime")
+                    + self.real_function("run")
+                    + f"SUPPORTS_K={supports_k}\n"
+                    + r"""
+                    command_exists() { :; }
+                    timeout() {
+                      if [[ "$1" == -k && "$SUPPORTS_K" -eq 0 ]]; then
+                        printf "timeout: invalid option -- 'k'\n" >&2
+                        return 125
+                      fi
+                      [[ "$*" != *" 1 true" ]] || return 0
+                      record "timeout $*"
+                    }
+                    DRY_RUN=1
+                    prepare_runtime
+                    DRY_RUN=0
+                    run true
+                    """
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.events.read_text().splitlines(), [expected])
+                self.assertEqual("commands still running at the deadline receive SIGKILL" in result.stderr, not supports_k)
+                self.assertNotIn("invalid option", result.stderr)
+
     def test_dry_run_previews_without_changing_files(self):
         yunjing = self.root / "usr/local/qcloud/YunJing"
         self.vendor_script(yunjing / "uninst.sh", "#!/bin/sh\nexit 0\n")
