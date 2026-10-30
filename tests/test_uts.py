@@ -278,7 +278,7 @@ class MainTests(UtsFixture):
     def test_every_message_has_an_english_and_a_chinese_text(self):
         source = re.sub(r"\\\n\s*", " ", SCRIPT.read_text())
         calls = [match for match in MESSAGE_CALL.finditer(source) if match[2] != '"$@"']
-        self.assertGreater(len(calls), 20)
+        self.assertGreater(len(calls), 120)
         for match in calls:
             if "${MSG}" in match[2]:
                 continue
@@ -473,10 +473,23 @@ class MainTests(UtsFixture):
             time.sleep(0.01)
         return self.terminal.decode()
 
-    def test_confirmation_accepts_only_yes(self):
+    def test_confirmation_shows_the_plan_and_accepts_only_yes(self):
         (self.root / "usr/local/qcloud/YunJing").mkdir(parents=True)
         (self.root / "usr/local/qcloud/stargate").mkdir(parents=True)
-        plan = ["[INFO] System: Debian GNU/Linux 12 (bookworm), x86_64"]
+        plan = [
+            "Uninstall-Tencent-Service 1.0.0",
+            "System: Debian GNU/Linux 12 (bookworm), x86_64",
+            "Mode: uninstall",
+            "==> Plan",
+            "  [remove] Host Security agent (YunJing)",
+            "  [keep]   Cloud Monitor (BaradAgent / Sgagent)",
+            "           Installed; add --include-monitor to uninstall it too.",
+            "  [clean]  TencentCloud Automation Tools (tat_agent)",
+            "           Not installed; remnants are still checked and cleaned.",
+            "  Turn off Agent uninstall protection in the Host Security console first.",
+            "  Without tat_agent, console commands and online password reset stop working.",
+            "  To preview without changes, run again with --dry-run.",
+        ]
         summary = [
             "==> Host Security agent (YunJing)",
             "==> TencentCloud Automation Tools (tat_agent)",
@@ -585,11 +598,11 @@ class MainTests(UtsFixture):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
                 english = [line for line in lines if not CJK.search(line)]
-                self.assertIn("系统：" if language == "zh" else "System: ", result.stdout)
+                self.assertIn("模式：强制卸载" if language == "zh" else "Mode: force uninstall", result.stdout)
                 if language == "en":
                     self.assertEqual(lines, english)
                 else:
-                    self.assertEqual(english, [], result.stdout + result.stderr)
+                    self.assertEqual(english, ["Uninstall-Tencent-Service 1.0.0"], result.stdout + result.stderr)
                     self.assertIn("云监控（BaradAgent / Sgagent）卸载未完成（1）。", result.stderr)
                     self.assertIn("Uninstall-Tencent-Service：未完成", result.stderr)
 

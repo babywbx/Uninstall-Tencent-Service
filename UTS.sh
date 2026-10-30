@@ -45,13 +45,13 @@ MSG=""
 DISTRO_PRETTY="unknown"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
-  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
   C_BLUE=$'\033[34m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
 else
-  C_RESET=''; C_BOLD=''
+  C_RESET=''; C_BOLD=''; C_DIM=''
   C_BLUE=''; C_GREEN=''; C_YELLOW=''; C_RED=''
 fi
-readonly C_RESET C_BOLD C_BLUE C_GREEN C_YELLOW C_RED
+readonly C_RESET C_BOLD C_DIM C_BLUE C_GREEN C_YELLOW C_RED
 
 cleanup() {
   if [[ -n "${WORKDIR}" ]]; then
@@ -306,6 +306,90 @@ component_selected() {
     monitor) [[ "${INCLUDE_MONITOR}" -eq 1 ]] ;;
     tat) [[ "${INCLUDE_TAT}" -eq 1 ]] ;;
   esac
+}
+
+component_installed() {
+  local path=""
+  local -a paths=() services=()
+  case "$1" in
+    yunjing) paths=("${YUNJING_DIRS[@]}"); services=("${YUNJING_SERVICES[@]}") ;;
+    monitor)
+      while IFS= read -r path; do paths+=("${path}"); done < <(monitor_targets)
+      services=("${MONITOR_SERVICES[@]}")
+      ;;
+    tat) paths=("${TAT_DIRS[@]}"); services=("${TAT_SERVICES[@]}") ;;
+  esac
+  for path in "${paths[@]}"; do
+    path_present "${path}" && return 0
+  done
+  [[ -n "$(service_files "${services[@]}")" ]]
+}
+
+row() {
+  printf '  %s%-8s%s %s\n' "$1" "$2" "${C_RESET}" "$3"
+}
+
+show_plan() {
+  local component="" flag="" name="" mode="" arch="" indent='           '
+  [[ "${UI_LANG}" != zh ]] || indent='         '
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    msg "dry run (nothing is changed)" "预览（不做任何修改）"
+  else
+    msg "uninstall" "卸载"
+  fi
+  mode="${MSG}"
+  [[ "${FORCE}" -eq 0 ]] || { msg "force ${mode}" "强制${mode}"; mode="${MSG}"; }
+  printf '\n%s%s %s%s\n' "${C_BOLD}" "${SCRIPT_NAME}" "${VERSION}" "${C_RESET}"
+  arch="$(uname -m)"
+  msg "System: ${DISTRO_PRETTY}, ${arch}" "系统：${DISTRO_PRETTY}，${arch}"
+  printf '%s\n' "${MSG}"
+  msg "Mode: ${mode}" "模式：${mode}"
+  printf '%s\n' "${MSG}"
+  section "Plan" "执行计划"
+  for component in yunjing monitor tat; do
+    component_name "${component}"
+    name="${MSG}"
+    flag="--include-${component}"
+    if component_installed "${component}"; then
+      if component_selected "${component}"; then
+        msg "[remove]" "[卸载]"; row "${C_RED}" "${MSG}" "${name}"
+      else
+        msg "[keep]" "[保留]"; row "" "${MSG}" "${name}"
+        msg "Installed; add ${flag} to uninstall it too." "已安装，加 ${flag} 可一并卸载。"
+        printf '%s%s%s%s\n' "${indent}" "${C_DIM}" "${MSG}" "${C_RESET}"
+      fi
+    elif component_selected "${component}"; then
+      msg "[clean]" "[清理]"; row "${C_BLUE}" "${MSG}" "${name}"
+      msg "Not installed; remnants are still checked and cleaned." "未安装，仍会检查并清理残留。"
+      printf '%s%s%s%s\n' "${indent}" "${C_DIM}" "${MSG}" "${C_RESET}"
+    else
+      msg "[skip]" "[跳过]"; row "${C_DIM}" "${MSG}" "${name}"
+    fi
+  done
+  printf '\n'
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    msg "Turn off Agent uninstall protection in the Host Security console first." "请先在主机安全控制台关闭「Agent 卸载保护」。"
+    printf '  %s%s%s\n' "${C_YELLOW}" "${MSG}" "${C_RESET}"
+    msg "The console then raises an agent uninstall alert." "卸载后控制台会产生 Agent 卸载告警。"
+    printf '  %s\n' "${MSG}"
+  fi
+  if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
+    msg "Without Cloud Monitor, memory and disk metrics stop in the console." "卸载云监控后，控制台的内存和磁盘指标将停止更新。"
+    printf '  %s\n' "${MSG}"
+  fi
+  if [[ "${INCLUDE_TAT}" -eq 1 ]]; then
+    msg "Without tat_agent, console commands and online password reset stop working." "卸载自动化助手后，控制台执行命令和在线重置密码将无法使用。"
+    printf '  %s\n' "${MSG}"
+  fi
+  if [[ "${FORCE}" -eq 1 ]]; then
+    msg "Force mode: cleanup continues after failures, may SIGKILL verified agents and masks service units." \
+      "强制模式：出错后继续清理，可能对已确认的 Agent 进程发送 SIGKILL 并屏蔽服务单元。"
+    printf '  %s\n' "${MSG}"
+  fi
+  if [[ "${AUTO_YES}" -eq 0 && "${DRY_RUN}" -eq 0 ]]; then
+    msg "To preview without changes, run again with --dry-run." "如需只预览不修改，请加 --dry-run 重新运行。"
+    printf '  %s%s%s\n' "${C_DIM}" "${MSG}" "${C_RESET}"
+  fi
 }
 
 confirm() {
@@ -1672,7 +1756,7 @@ main() {
   preflight_paths || die "Unsafe installation paths. No uninstall was attempted." "安装路径不安全，未执行任何卸载。"
   preflight_launcher || die "Run from an SSH session or a detached unit such as systemd-run. No uninstall was attempted." \
     "请在 SSH 会话或 systemd-run 等独立单元中运行，未执行任何卸载。"
-  log "System: ${DISTRO_PRETTY}, $(uname -m)" "系统：${DISTRO_PRETTY}，$(uname -m)"
+  show_plan
   confirm
   prune_mask_state || die "Cannot update ${MASK_STATE}. No uninstall was attempted." "无法更新 ${MASK_STATE}，未执行任何卸载。"
 
