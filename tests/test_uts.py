@@ -226,7 +226,11 @@ class MainTests(UtsFixture):
             ("--timeout ''", None),
             ("--timeout", None),
             ("--bogus", None),
-            ("--timeout 9", "9"),
+            ("--lang zh", "120"),
+            ("--lang en --timeout 9", "9"),
+            ("--lang", None),
+            ("--lang fr", None),
+            ("--lang ''", None),
         ):
             with self.subTest(arguments=arguments):
                 result = self.run_shell(f'parse_args {arguments}\nprintf "%s\\n" "$COMMAND_TIMEOUT"\n')
@@ -238,15 +242,16 @@ class MainTests(UtsFixture):
                     self.assertEqual(result.stdout, "")
                     self.assertIn("[FAIL]", result.stderr)
         for arguments, message in (
-            ("--bogus", "[FAIL] 未知选项：--bogus"),
-            ("--timeout 0", "[FAIL] --timeout 需要 1 到 3600 之间的秒数。"),
+            ("--bogus --lang zh", "[FAIL] 未知选项：--bogus"),
+            ("--timeout 0 --lang zh", "[FAIL] --timeout 需要 1 到 3600 之间的秒数。"),
+            ("--lang zh --bogus --lang en", "[FAIL] Unknown option: --bogus"),
         ):
             with self.subTest(arguments=arguments):
-                result = self.run_shell(f"UI_LANG=zh\nparse_args {arguments}\n")
+                result = self.run_shell(f"parse_args {arguments}\n")
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn(message, result.stderr)
 
-    def test_help_lists_every_option_and_exit_status(self):
+    def test_help_follows_the_selected_language(self):
         def invoke(arguments, **environment):
             return subprocess.run(
                 [BASH, str(SCRIPT), *arguments],
@@ -257,19 +262,25 @@ class MainTests(UtsFixture):
                 timeout=10,
             )
 
-        for arguments, environment in ((["--help"], {}), (["-h"], {"LANG": "en_US.UTF-8", "LC_ALL": "C"})):
+        for arguments, environment, language in (
+            (["--help"], {}, "zh"),
+            (["-h"], {"LANG": "en_US.UTF-8", "LC_ALL": "C"}, "zh"),
+            (["--help", "--lang", "en"], {}, "en"),
+            (["--lang", "en", "-h"], {"LANG": "zh_CN.UTF-8"}, "en"),
+            (["-h", "--lang", "en"], {}, "en"),
+            (["-h", "--lang", "en", "--lang", "zh"], {}, "zh"),
+        ):
             with self.subTest(arguments=arguments, environment=environment):
                 result = invoke(arguments, **environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stderr, "")
                 self.assertIn("Uninstall-Tencent-Service 1.0.0", result.stdout)
-                self.assertRegex(result.stdout, CJK)
-                self.assertIn("用法：", result.stdout)
-        english = self.run_shell("UI_LANG=en\nusage\n").stdout
+                self.assertEqual(bool(CJK.search(result.stdout)), language == "zh", result.stdout)
+                self.assertIn("用法：" if language == "zh" else "Usage:", result.stdout)
+        english = invoke(["--help", "--lang", "en"]).stdout
         chinese = invoke(["--help"]).stdout
-        self.assertIn("Usage:", english)
         options = re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", english, re.M)
-        self.assertGreaterEqual(len(options), 7)
+        self.assertGreaterEqual(len(options), 8)
         self.assertEqual(options, re.findall(r"^\s+(?:-\w, )?(--[a-z-]+)", chinese, re.M))
         for code in ("0", "1", "6", "124, 137", "130, 143"):
             self.assertRegex(english, rf"(?m)^  {code}\s+\w")
@@ -610,7 +621,7 @@ class MainTests(UtsFixture):
                     self.STUBBED_MAIN
                     + 'uninstall_monitor() { step "Cloud Monitor (BaradAgent / Sgagent)" "云监控（BaradAgent / Sgagent）"; return 1; }\n'
                     + "verify_uninstall() { warn \"Agent processes remain:\" \"仍有 Agent 进程：\"; return 1; }\n"
-                    + f"UI_LANG={language}\nmain --yes --force --include-monitor --include-tat\n"
+                    + f"main --yes --force --include-monitor --include-tat --lang {language}\n"
                 )
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]

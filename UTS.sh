@@ -103,11 +103,13 @@ ${SCRIPT_NAME} ${VERSION}
                            Agent 进程使用 SIGKILL，屏蔽服务单元（原定义备份到
                            /var/backups），并修复阻止删除的文件属性
       --timeout 秒数       每条受管命令的超时，1 到 3600（默认 120）
+      --lang zh|en         输出语言（默认 zh）
   -h, --help               显示本帮助
 
 主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再停止、
 删除并验证剩余内容，不会执行 init 停止脚本。
 运行前请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。
+VNC 等无法显示中文的终端请加 --lang en。
 
 退出码：
   0         卸载已验证，或预览完成
@@ -134,6 +136,7 @@ Options:
                            service units (definitions backed up to /var/backups) and
                            repair blocking file attributes
       --timeout SECONDS    Timeout for each managed command, 1 to 3600 (default: 120)
+      --lang zh|en         Output language (default: zh)
   -h, --help               Show this help message
 
 Host Security (YunJing) is always uninstalled. Runs the official uninstallers found
@@ -284,7 +287,11 @@ detect_distro() {
 }
 
 parse_args() {
-  local help=0
+  local help=0 arg="" previous=""
+  for arg in "$@"; do
+    if [[ "${previous}" == --lang && ( "${arg}" == en || "${arg}" == zh ) ]]; then UI_LANG="${arg}"; fi
+    previous="${arg}"
+  done
   while (($# > 0)); do
     case "$1" in
       -y|--yes) AUTO_YES=1 ;;
@@ -296,6 +303,10 @@ parse_args() {
         [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,3}$ && "$2" -le 3600 ]] \
           || die "--timeout requires 1 to 3600 seconds." "--timeout 需要 1 到 3600 之间的秒数。"
         COMMAND_TIMEOUT="$2"
+        shift
+        ;;
+      --lang)
+        [[ $# -ge 2 && ( "$2" == en || "$2" == zh ) ]] || die "--lang requires zh or en." "--lang 只能是 zh 或 en。"
         shift
         ;;
       -h|--help) help=1 ;;
