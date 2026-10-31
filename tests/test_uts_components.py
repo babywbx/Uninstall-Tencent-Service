@@ -212,8 +212,38 @@ class YunjingTests(UtsFixture):
                     else:
                         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                         self.assertIn("Local cleanup was not started.", result.stderr)
+                        self.assertEqual("Agent uninstall protection is probably on" in result.stderr, expected >= 128)
                         self.assertEqual(self.events.read_text().splitlines(), official)
                         self.assertTrue(script.is_symlink() or script.is_file())
+
+    def test_official_uninstaller_that_leaves_the_agent_running_stops_everything(self):
+        script = self.vendor_script(
+            self.primary / "uninst.sh",
+            "#!/bin/bash\nfor _ in 1 2; do printf 'please enter the verification code 123456: \\n'; done\nexit 0\n",
+        )
+        (self.root / "etc/cron.d").mkdir()
+        cron = self.root / "etc/cron.d/yunjing"
+        cron.write_text("*/30 * * * * root /usr/local/qcloud/YunJing/YDCrontab.sh > /dev/null 2>&1\n")
+        for running, force in ((True, 0), (True, 1), (False, 0)):
+            with self.subTest(running=running, force=force):
+                agent = self.root / f"proc/4242"
+                if running and not agent.exists():
+                    self.process(4242, str(self.primary / "YDEyes/YDService"), [str(self.primary / "YDEyes/YDService")])
+                elif not running and agent.exists():
+                    shutil.rmtree(agent)
+                result = self.run_shell(self.executed(f"FORCE={force}\n"))
+                official = self.official(script, "timeout -k 5 120")
+                if running:
+                    self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+                    self.assertEqual(self.events.read_text().splitlines(), [official] + ["sleep 1"] * 4)
+                    self.assertIn("official uninst.sh exited without uninstalling", result.stderr)
+                    self.assertIn("run " + str(script) + " yourself and enter the code", result.stderr)
+                    self.assertIn("No local cleanup was done.", result.stderr)
+                    self.assertTrue(cron.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.events.read_text().splitlines()[0], official)
+                    self.assertIn("stop-services YDService YDLive", self.events.read_text())
 
     def test_untrusted_official_uninstaller_is_skipped_for_local_cleanup(self):
         script = self.vendor_script(self.primary / "uninst.sh", self.logging_script("untrusted"))
@@ -264,6 +294,7 @@ class YunjingTests(UtsFixture):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertFalse(self.vendor_log.exists())
                 self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
+                self.assertNotIn("run " + str(self.primary / "uninst.sh") + " yourself", result.stderr)
 
     def test_installer_download_dirs_are_removed_only_when_they_match(self):
         tmp = self.root / "tmp"

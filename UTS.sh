@@ -13,6 +13,7 @@ FAILURES=0
 RUN_PID=""
 QUERY_OUTPUT=""
 QUERY_ERROR=""
+OFFICIAL_RAN=0
 MASK_BACKUP=""
 CREATED_MASKS=()
 STALE_MASKS=()
@@ -475,6 +476,7 @@ root_owned_private() {
 
 run_local_script() {
   local script_path="$1" root_dir="$3" description="" dir="" header="" rc=0
+  OFFICIAL_RAN=0
   msg "official $2${script_path}" "官方卸载程序 $2${script_path}"
   description="${MSG}"
   if [[ -L "${script_path}" || ! -f "${script_path}" ]]; then
@@ -502,6 +504,7 @@ run_local_script() {
     return 1
   fi
   log "Running ${description}" "正在运行${description}"
+  OFFICIAL_RAN=1
   run sh -c 'cd -- "${1%/*}" && exec "$1"' uts "${script_path}" || rc=$?
   return "${rc}"
 }
@@ -1651,6 +1654,24 @@ yunjing_present() {
   [[ -n "${targets}" ]]
 }
 
+protection_hint() {
+  warn "Agent uninstall protection is probably on, so the official uninstaller asks for a verification code." \
+    "这通常说明「Agent 卸载保护」已开启，此时官方卸载程序会要求输入验证码。"
+  warn "Turn the protection off in the Host Security console, or run $1/uninst.sh yourself and enter the code." \
+    "请在主机安全控制台关闭该保护，或亲自运行 $1/uninst.sh 并按提示输入验证码。"
+}
+
+yunjing_running() {
+  local targets="" attempt=1
+  while :; do
+    targets="$(agent_processes "${YUNJING_DIRS[@]}")" || return 2
+    [[ -n "${targets}" ]] || return 1
+    [[ "${attempt}" -lt 5 ]] || return 0
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+}
+
 guard_hint() {
   warn "In the Host Security console, turn off Agent uninstall protection or remove" "请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。"
   warn "this server from its scope, wait about a minute, then run this script again." "约一分钟后重新运行本脚本。"
@@ -1692,10 +1713,23 @@ uninstall_yunjing() {
     break
   done
   [[ "${ran}" -eq 1 ]] || log "No official uninst.sh found; cleaning local remnants only." "未找到官方 uninst.sh，仅清理本地残留。"
+  if [[ "${OFFICIAL_RAN}" -eq 1 && "${official_rc}" -eq 0 && "${DRY_RUN}" -eq 0 ]] && path_present "${dir}"; then
+    if yunjing_running; then
+      warn "The official uninst.sh exited without uninstalling; the agent is still running." "官方 uninst.sh 已退出但没有完成卸载，Agent 仍在运行。"
+      protection_hint "${dir}"
+      warn "Then run this script again. No local cleanup was done." "完成后重新运行本脚本。本次未做任何本地清理。"
+      return 6
+    else
+      rc=$?
+      [[ "${rc}" -eq 1 ]] || return "${rc}"
+      rc=0
+    fi
+  fi
   if [[ "${official_rc}" -ne 0 ]]; then
     warn "Official uninst.sh exited with status ${official_rc}." "官方 uninst.sh 退出码为 ${official_rc}。"
     if [[ "${FORCE}" -eq 0 || "${official_rc}" -eq 124 || "${official_rc}" -ge 128 ]]; then
       warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
+      [[ "${official_rc}" -lt 128 ]] || protection_hint "${dir}"
       return "${official_rc}"
     fi
     warn "Force mode: trying scoped local cleanup." "强制模式：尝试限定范围的本地清理。"
