@@ -22,6 +22,7 @@ BACKUP_ROOT="/var/backups"
 YUNJING_DIRS=(/usr/local/qcloud/YunJing /var/lib/qcloud/YunJing)
 YUNJING_RUNTIME=(/run/ydeyes /var/run/ydeyes /var/cache/ydeyes)
 YUNJING_FILES=(/tmp/yunjing_install /tmp/yunjing_install_nohup /tmp/ydeye_install.log /var/run/YDService.pid /var/run/YDLive.pid)
+CGROUP_ROOT="/sys/fs/cgroup"
 STARGATE_DIRS=(/usr/local/qcloud/stargate /var/lib/qcloud/stargate)
 MONITOR_DIRS=(/usr/local/qcloud/monitor /var/lib/qcloud/monitor)
 MONITOR_FILES=(/tmp/stargate.lock /usr/bin/cagent_tools /opt/bin/cagent_tools /var/run/stargate.tencentyun.pid
@@ -581,6 +582,23 @@ yunjing_installer_dirs() {
   return 0
 }
 
+remove_cgroups() {
+  local name="" top="" dir="" rc=0
+  local -a find_names=()
+  [[ -d "${CGROUP_ROOT}" ]] || return 0
+  for name in "$@"; do
+    [[ "${#find_names[@]}" -eq 0 ]] || find_names+=(-o)
+    find_names+=(-name "${name}")
+  done
+  while IFS= read -r top; do
+    while IFS= read -r dir; do
+      run rmdir -- "${dir}" || rc=1
+    done < <(find "${top}" -depth -type d -print 2>/dev/null)
+  done < <(find "${CGROUP_ROOT}" -mindepth 1 -maxdepth 3 -type d \( "${find_names[@]}" \) -prune -print 2>/dev/null)
+  [[ "${rc}" -eq 0 ]] || warn "Some agent cgroups remain; they disappear after a reboot." "部分 Agent cgroup 仍在，重启后会消失。"
+  return 0
+}
+
 selected_leftovers() {
   printf '%s\n' "${YUNJING_FILES[@]}"
   if [[ "${INCLUDE_MONITOR}" -eq 1 ]]; then
@@ -1115,6 +1133,7 @@ cleanup_services() {
       fi
     done
   done
+  [[ "${rc}" -ne 0 ]] || remove_cgroups "${@/%/.service}"
   return "${rc}"
 }
 
@@ -1705,6 +1724,7 @@ uninstall_yunjing() {
   remove_paths tree "${YUNJING_DIRS[@]}" "${YUNJING_RUNTIME[@]}" ${installers[@]+"${installers[@]}"} || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   remove_paths file "${YUNJING_FILES[@]}" || { rc=$?; stop_on "${rc}" && return "${rc}"; rc=1; }
   [[ "${rc}" -eq 0 ]] || return 1
+  remove_cgroups YunJing
   if [[ "${present}" -eq 1 ]]; then
     guard_check || return $?
   fi

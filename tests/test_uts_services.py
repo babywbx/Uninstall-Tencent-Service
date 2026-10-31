@@ -290,6 +290,23 @@ class ServiceTests(UtsFixture):
             ["run systemctl daemon-reload", "run systemctl reset-failed tat_agent.service"],
         )
 
+    def test_cleanup_removes_unit_cgroups_after_successful_cleanup(self):
+        self.enable_systemd()
+        cgroup = self.root / "sys/fs/cgroup/memory/system.slice/tat_agent.service"
+        cgroup.mkdir(parents=True)
+        for cleanup_rc, removed in ((0, True), (1, False)):
+            with self.subTest(cleanup_rc=cleanup_rc):
+                result = self.run_shell(
+                    r'''
+                    command_exists() { [[ "$1" == systemctl ]]; }
+                    timeout() { printf 'ActiveState=inactive\n'; }
+                    '''
+                    + f'run() {{ record "run $*"; [[ "$1" != systemctl ]] || return {cleanup_rc}; }}\n'
+                    + 'cleanup_services "${TAT_SERVICES[@]}"\n'
+                )
+                self.assertEqual(result.returncode, cleanup_rc, result.stdout + result.stderr)
+                self.assertEqual(f"run rmdir -- {cgroup}" in self.events.read_text().splitlines(), removed)
+
     def test_preexisting_mask_is_left_alone_and_passes_verification(self):
         self.enable_systemd()
         self.unit.symlink_to("/dev/null")

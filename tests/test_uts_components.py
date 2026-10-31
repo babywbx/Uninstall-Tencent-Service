@@ -308,6 +308,51 @@ class YunjingTests(UtsFixture):
         result = self.run_shell(stat_stub + "yunjing_installer_dirs\n")
         self.assertEqual(result.stdout, f"{tmp}/1f88b16d145d24dffb5bb86e5bfeed14\n")
 
+    def test_agent_cgroups_are_removed_deepest_first(self):
+        cgroup = self.root / "sys/fs/cgroup"
+        created = [
+            cgroup / "YunJing/YDEyes",
+            cgroup / "memory/YunJing",
+            cgroup / "cpu,cpuacct/YunJing",
+            cgroup / "pids/system.slice/tat_agent.service",
+            cgroup / "memory/user.slice/YunJing-like",
+            cgroup / "system.slice/sshd.service",
+        ]
+        for path in created:
+            path.mkdir(parents=True)
+        for names, fails in ((("YunJing",), False), (("tat_agent.service", "tat_install.service"), False), (("YunJing",), True)):
+            with self.subTest(names=names, fails=fails):
+                result = self.run_shell(
+                    'run() { record "run $*"; '
+                    + ('return 1; }\n' if fails else 'command "$@"; }\n')
+                    + f"remove_cgroups {' '.join(names)}\n"
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                events = self.events.read_text().splitlines()
+                if names == ("YunJing",) and not fails:
+                    self.assertCountEqual(events, [
+                        f"run rmdir -- {cgroup}/YunJing/YDEyes",
+                        f"run rmdir -- {cgroup}/YunJing",
+                        f"run rmdir -- {cgroup}/memory/YunJing",
+                        f"run rmdir -- {cgroup}/cpu,cpuacct/YunJing",
+                    ])
+                    self.assertLess(
+                        events.index(f"run rmdir -- {cgroup}/YunJing/YDEyes"),
+                        events.index(f"run rmdir -- {cgroup}/YunJing"),
+                    )
+                    self.assertFalse((cgroup / "YunJing").exists())
+                elif not fails:
+                    self.assertEqual(events, [f"run rmdir -- {cgroup}/pids/system.slice/tat_agent.service"])
+                else:
+                    self.assertEqual(events, [])
+                    self.assertNotIn("cgroups remain", result.stderr)
+                self.assertTrue((cgroup / "memory/user.slice/YunJing-like").is_dir())
+                self.assertTrue((cgroup / "system.slice/sshd.service").is_dir())
+        (cgroup / "YunJing").mkdir()
+        result = self.run_shell('run() { record "run $*"; return 1; }\nremove_cgroups YunJing\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Some agent cgroups remain; they disappear after a reboot.", result.stderr)
+
     def test_kernel_protection_blocks_cleanup_after_official_uninstaller(self):
         self.enable_proc()
         for official, dry_run, force, expected in (
