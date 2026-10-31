@@ -126,6 +126,8 @@ class UtsFixture(unittest.TestCase):
             chkconfig() { blocked chkconfig "$@"; }
             update-rc.d() { blocked update-rc.d "$@"; }
             timeout() { blocked timeout "$@"; }
+            unset SECONDS  # decouple guard clock from wall time
+            SECONDS=0
             sleep() { record "sleep $*"; SECONDS=$((SECONDS + $1)); }
             uname() {
               case "${1:--s}" in
@@ -566,12 +568,21 @@ class MainTests(UtsFixture):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
                 **self.answer(None),
             )
             try:
                 self.assertIn("Continue? [y/N]", self.terminal_text())
-                process.send_signal(signal.SIGINT)
-                stdout, stderr = process.communicate(timeout=5)
+                # SIGINT just before read() blocks stays pending; press again.
+                for _ in range(10):
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        stdout, stderr = process.communicate(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                else:
+                    self.fail("SIGINT did not interrupt the confirmation prompt")
             finally:
                 if process.poll() is None:
                     process.kill()
