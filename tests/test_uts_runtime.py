@@ -27,6 +27,44 @@ FLOCK = shutil.which("flock")
 
 @unittest.skipUnless(GNU_TIMEOUT, "GNU or uutils timeout is required for real runtime tests")
 class RuntimeTests(UtsFixture):
+    @unittest.skipUnless(shutil.which("cc") and shutil.which("stdbuf"), "cc and stdbuf are required")
+    def test_buffered_official_prompt_is_flushed_before_waiting_for_verification(self):
+        source = self.base / "buffered-uninstaller.c"
+        binary = self.base / "buffered-uninstaller"
+        source.write_text(
+            '#include <stdio.h>\n'
+            '#include <string.h>\n'
+            'int main(void) {\n'
+            '    char answer[32];\n'
+            '    printf("If you want to uninstall Yunjing, please enter the verification code 012345: ");\n'
+            '    if (fgets(answer, sizeof answer, stdin) == NULL) return 41;\n'
+            '    if (strcmp(answer, "012345\\n") != 0) return 42;\n'
+            '    puts("\\nverification accepted");\n'
+            '    return 0;\n'
+            '}\n'
+        )
+        compiled = subprocess.run(
+            [shutil.which("cc"), str(source), "-o", str(binary)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+        workdir = self.root / "tmp/buffered-verification"
+        workdir.mkdir(mode=0o700)
+        result = self.run_shell(
+            self.real_function("run")
+            + f'timeout() {{ {shlex.quote(GNU_TIMEOUT)} "$@"; }}\n'
+            + f"WORKDIR={shlex.quote(str(workdir))}\n"
+            + "COMMAND_TIMEOUT=1\nTIMEOUT_KILL=(-k 1)\nrc=0\n"
+            + f"run_yunjing_script {shlex.quote(str(binary))} || rc=$?\n"
+            + 'printf "status=%s\\nrun_pid=%s\\n" "$rc" "$RUN_PID"\n'
+            + 'exit "$rc"\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verification accepted", result.stdout)
+        self.assertIn("status=0\nrun_pid=\n", result.stdout)
+
     def test_verification_responds_without_newlines_and_preserves_real_exit_status(self):
         binaries = self.base / "verification-bin"
         binaries.mkdir()

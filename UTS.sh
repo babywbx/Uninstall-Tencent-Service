@@ -257,7 +257,7 @@ require_linux() {
 
 prepare_runtime() {
   local tool=""
-  for tool in awk readlink stat grep cksum find timeout flock mkfifo; do
+  for tool in awk readlink stat grep cksum find timeout flock mkfifo stdbuf; do
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
   if ! timeout -k 1 1 true 2>/dev/null; then
@@ -500,7 +500,7 @@ export LC_ALL=C
 trap ':' TERM
 exec 4<>"$1" || exit 1
 cd -- "${2%/*}" || exit 1
-"$2" <&4 4>&- 2>&1 | answer_yunjing_code
+stdbuf -o0 -e0 "$2" <&4 4>&- 2>&1 | answer_yunjing_code
 HELPER
   } >"${helper}" || return 1
   run bash "${helper}" "${input}" "$1"
