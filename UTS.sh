@@ -7,7 +7,7 @@ readonly VERSION="1.0.0"
 WORKDIR=""
 COMMAND_TIMEOUT=120
 TIMEOUT_KILL=(-k 5)
-GUARD_WAIT=60
+GUARD_WAIT=5
 FORCE=0
 FAILURES=0
 RUN_PID=""
@@ -111,7 +111,7 @@ ${SCRIPT_NAME} ${VERSION}
 
 主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再停止、
 删除并验证剩余内容，不会执行 init 停止脚本。
-确认卸载后，会自动填写官方卸载程序显示的验证码。
+确认卸载后，会自动填写官方卸载程序显示的验证码。卸载后复查 5 秒。
 VNC 等无法显示中文的终端请加 --lang en。
 
 退出码：
@@ -148,6 +148,7 @@ Host Security (YunJing) is always uninstalled. Runs the official uninstallers fo
 on the host, then stops, removes and verifies the remnants locally. Init stop
 scripts are never executed.
 After confirmation, automatically enters the code displayed by the official uninstaller.
+Checks for agent reappearance for 5 seconds after removal.
 
 Exit status:
   0         uninstall verified, or dry run finished
@@ -1714,12 +1715,10 @@ guard_hint() {
 }
 
 guard_check() {
-  local waited=0 rc=0
+  local deadline=$((SECONDS + GUARD_WAIT)) rc=0
   [[ "${DRY_RUN}" -eq 0 ]] || return 0
-  log "Watching ${GUARD_WAIT}s for uninstall protection to reinstall the agent." "观察 ${GUARD_WAIT} 秒，确认卸载保护没有重装 Agent。"
-  while ((waited < GUARD_WAIT)); do
-    sleep 5
-    waited=$((waited + 5))
+  log "Checking for agent reappearance for ${GUARD_WAIT}s after removal." "卸载后复查 ${GUARD_WAIT} 秒，检查 Agent 是否重新出现。"
+  while :; do
     if yunjing_present; then
       warn "Host Security agent files or processes reappeared after removal." "主机安全 Agent 的文件或进程在删除后重新出现。"
       guard_hint
@@ -1728,6 +1727,8 @@ guard_check() {
       rc=$?
       [[ "${rc}" -eq 1 ]] || return "${rc}"
     fi
+    [[ "${SECONDS}" -lt "${deadline}" ]] || break
+    sleep 1
   done
 }
 

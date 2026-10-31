@@ -519,33 +519,33 @@ class YunjingTests(UtsFixture):
                 self.assertIn("PID 4242", result.stderr)
                 self.assertIn("turn off Agent uninstall protection", result.stderr)
 
-    def test_guard_check_polls_every_five_seconds_for_a_minute(self):
+    def test_guard_check_polls_every_second_for_five_seconds(self):
         self.enable_proc()
         for dry_run in (0, 1):
             with self.subTest(dry_run=dry_run):
                 result = self.run_shell(f"DRY_RUN={dry_run}\nguard_check\n")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"] * 12 * (1 - dry_run))
-                self.assertEqual("Watching 60s for uninstall protection" in result.stdout, not dry_run)
+                self.assertEqual(self.events.read_text().splitlines(), ["sleep 1"] * 5 * (1 - dry_run))
+                self.assertEqual("Checking for agent reappearance for 5s" in result.stdout, not dry_run)
                 self.assertEqual(result.stderr, "")
 
-    def test_guard_detects_existing_remnants_on_first_poll(self):
+    def test_guard_detects_existing_remnants_without_waiting(self):
         self.primary.mkdir(parents=True)
         result = self.run_shell("guard_check\n")
         self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
-        self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"])
+        self.assertEqual(self.events.read_text(), "")
 
     def test_guard_detects_process_reappearing_on_final_check(self):
         result = self.run_shell(
             r"""
             polls=0
             sleep() { record "sleep $*"; polls=$((polls + 1)); }
-            agent_processes() { [[ "$polls" -lt 12 ]] || printf '4242|agent|1|args\n'; return 0; }
+            agent_processes() { [[ "$polls" -lt 5 ]] || printf '4242|agent|1|args\n'; return 0; }
             guard_check
             """
         )
         self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
-        self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"] * 12)
+        self.assertEqual(self.events.read_text().splitlines(), ["sleep 1"] * 5)
 
     def test_dry_run_does_not_start_verification_or_create_pipes(self):
         self.vendor_script(self.primary / "uninst.sh", self.logging_script("unexpected"))
@@ -570,7 +570,7 @@ class YunjingTests(UtsFixture):
             """
         )
         self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
-        self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"] * 3)
+        self.assertEqual(self.events.read_text().splitlines(), ["sleep 1"] * 3)
         self.assertIn("Host Security agent files or processes reappeared after removal.", result.stderr)
         self.assertIn("turn off Agent uninstall protection", result.stderr)
 
@@ -590,8 +590,8 @@ class YunjingTests(UtsFixture):
                     """
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual("Watching 60s for uninstall protection" in result.stdout, present)
-                self.assertEqual(self.events.read_text().count("sleep 5"), 12 if present else 0)
+                self.assertEqual("Checking for agent reappearance" in result.stdout, present)
+                self.assertEqual(self.events.read_text().count("sleep 1"), 5 if present else 0)
                 self.assertFalse(self.primary.exists())
 
     def test_yunjing_present_detects_directory_or_process(self):
@@ -660,7 +660,7 @@ class YunjingTests(UtsFixture):
                 agent_processes() { record scan-failed; return 1; }
                 run() { record "run $*"; command "$@"; }
                 CREATED_MASKS=("$UTS_TEST_ROOT/etc/systemd/system/YDService.service")
-                GUARD_WAIT=60
+                GUARD_WAIT=5
                 uninstall_yunjing
                 """
             )

@@ -762,7 +762,6 @@ class MainTests(UtsFixture):
                         "var/run/YDLive.pid",
                     )
                 ),
-                "sleep 5",
             ],
         )
 
