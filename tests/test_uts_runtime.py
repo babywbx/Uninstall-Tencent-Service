@@ -8,7 +8,7 @@ import sys
 import time
 import unittest
 
-from test_uts import BASH, UtsFixture
+from test_uts import BASH, ROOT_STAT, UtsFixture
 
 
 GNU_TIMEOUT = shutil.which("timeout") or shutil.which("gtimeout")
@@ -27,6 +27,94 @@ FLOCK = shutil.which("flock")
 
 @unittest.skipUnless(GNU_TIMEOUT, "GNU or uutils timeout is required for real runtime tests")
 class RuntimeTests(UtsFixture):
+    def test_verification_responds_without_newlines_and_preserves_real_exit_status(self):
+        binaries = self.base / "verification-bin"
+        binaries.mkdir()
+        timeout_pid = self.base / "verification-timeout.pid"
+        child_pid = self.base / "verification-child.pid"
+        timeout_shim = binaries / "timeout"
+        timeout_shim.write_text(
+            "#!/bin/sh\n"
+            + f'printf "%s\\n" "$$" > {shlex.quote(str(timeout_pid))}\n'
+            + f'exec {shlex.quote(GNU_TIMEOUT)} "$@"\n'
+        )
+        timeout_shim.chmod(0o755)
+        cases = (
+            ("zh", "如果您想继续卸载主机安全客户端，请输入验证码 012345: ", 1, 0),
+            ("en", "If you want to uninstall Yunjing, please enter the verification code 012345: ", 2, 0),
+            ("failure", None, 1, 7),
+            ("unknown", "Unrecognized confirmation: ", 1, 124),
+            ("silent", "", 1, 124),
+        )
+        for name, prompt, output_fd, expected in cases:
+            with self.subTest(case=name):
+                timeout_pid.unlink(missing_ok=True)
+                child_pid.unlink(missing_ok=True)
+                vendor_body = f'printf "%s\\n" "$$" > {shlex.quote(str(child_pid))}\n'
+                if prompt is None:
+                    vendor_body += "exit 7\n"
+                else:
+                    vendor_body += (
+                        f"printf '%s' {shlex.quote(prompt)} >&{output_fd}\n"
+                        + "IFS= read -r answer || exit 41\n"
+                        + '[[ "$answer" == 012345 ]] || exit 42\n'
+                        + "printf '\\nverification accepted\\n'\n"
+                    )
+                script = self.vendor_script(
+                    self.root / "usr/local/qcloud/YunJing/uninst.sh",
+                    f"#!{BASH}\n" + vendor_body,
+                )
+                workdir = self.root / f"tmp/verification-{name}"
+                workdir.mkdir(mode=0o700)
+                body = (
+                    f"source {shlex.quote(str(self.source))}\n"
+                    + ROOT_STAT
+                    + f"WORKDIR={shlex.quote(str(workdir))}\n"
+                    + "trap cleanup EXIT\ntrap 'interrupt 143' TERM\n"
+                    + "COMMAND_TIMEOUT=1\nTIMEOUT_KILL=(-k 1)\nrc=0\n"
+                    + f"run_local_script {shlex.quote(str(script))} '' "
+                    + f"{shlex.quote(str(script.parent))} verification || rc=$?\n"
+                    + 'printf "status=%s\\nrun_pid=%s\\n" "$rc" "$RUN_PID"\n'
+                    + 'exit "$rc"\n'
+                )
+                environment = self.shell_environment()
+                environment["PATH"] = str(binaries) + os.pathsep + environment["PATH"]
+                process = subprocess.Popen(
+                    [BASH, "--noprofile", "--norc", "-c", body],
+                    cwd=self.base,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                try:
+                    stdout, stderr = process.communicate(timeout=10)
+                    self.assertEqual(process.returncode, expected, stdout + stderr)
+                    self.assertIn(f"status={expected}\nrun_pid=\n", stdout)
+                    self.assertEqual("verification accepted" in stdout, expected == 0)
+                    self.assertFalse(workdir.exists())
+                    self.assertTrue(child_pid.is_file(), stdout + stderr)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(int(child_pid.read_text()), 0)
+                finally:
+                    owned_pids = [process.pid]
+                    for pidfile in (timeout_pid, child_pid):
+                        if pidfile.is_file() and pidfile.read_text().strip().isdecimal():
+                            owned_pids.append(int(pidfile.read_text()))
+                    for pid in owned_pids:
+                        try:
+                            if os.getsid(pid) == process.pid:
+                                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    process.wait(timeout=3)
+                    if process.stdout:
+                        process.stdout.close()
+                    if process.stderr:
+                        process.stderr.close()
+
     @unittest.skipUnless(FLOCK, "flock is required for the real lock test")
     def test_lock_rejects_inheriting_instance_and_releases_on_exit(self):
         proc = self.root / "proc/self"
@@ -143,22 +231,29 @@ class RuntimeTests(UtsFixture):
 @unittest.skipUnless(GNU_TIMEOUT, "GNU or uutils timeout is required")
 class InterruptTests(UtsFixture):
     def test_interrupt_stops_term_ignoring_child_and_preserves_bystander(self):
-        self.check_interrupt_cleanup()
+        self.check_interrupt_cleanup(verification=False)
+
+    def test_interrupt_stops_verification_wrapper_and_preserves_bystander(self):
+        self.check_interrupt_cleanup(verification=True)
 
     def test_interrupt_stops_service_query_without_waiting_for_deadline(self):
-        self.check_interrupt_cleanup(query=True)
+        self.check_interrupt_cleanup(verification=False, query=True)
 
     def test_interrupt_stops_child_with_timeout_kill_fallback(self):
-        self.check_interrupt_cleanup(kill_after=False)
+        self.check_interrupt_cleanup(verification=False, kill_after=False)
+
+    def test_interrupt_stops_verification_with_timeout_kill_fallback(self):
+        self.check_interrupt_cleanup(verification=True, kill_after=False)
 
     def test_interrupt_stops_root_crontab_query_without_waiting_for_deadline(self):
-        self.check_interrupt_cleanup(query="crontab")
+        self.check_interrupt_cleanup(verification=False, query="crontab")
 
-    def check_interrupt_cleanup(self, query=False, kill_after=True):
+    def check_interrupt_cleanup(self, verification, query=False, kill_after=True):
         binaries = self.base / "bin"
         binaries.mkdir()
         timeout_pid = self.base / "timeout.pid"
         child_pid = self.base / "child.pid"
+        wrapper_pid = self.base / "wrapper.pid"
         workdir = self.root / "tmp/runtime-work"
         shim = binaries / "timeout"
         shim.write_text(
@@ -187,6 +282,22 @@ class InterruptTests(UtsFixture):
             body += (
                 "remove_cron_lines /qcloud/YunJing/\n"
                 if query == "crontab" else "prepare_service_stop tat_agent.service\n"
+            )
+        elif verification:
+            script = self.vendor_script(
+                self.root / "usr/local/qcloud/YunJing/uninst.sh",
+                f"#!{BASH}\n"
+                + 'trap "" TERM\n'
+                + f'printf "%s\\n" "$PPID" > {shlex.quote(str(wrapper_pid))}\n'
+                + "printf 'If you want to uninstall Yunjing, please enter the verification code 012345: '\n"
+                + 'IFS= read -r answer && [[ "$answer" == 012345 ]] || exit 41\n'
+                + f'printf "%s\\n" "$$" > {shlex.quote(str(child_pid))}\n'
+                + "exec sleep 30\n",
+            )
+            body += (
+                ROOT_STAT
+                + f"run_local_script {shlex.quote(str(script))} '' "
+                + f"{shlex.quote(str(script.parent))} verification\n"
             )
         else:
             body += (
@@ -248,10 +359,14 @@ class InterruptTests(UtsFixture):
                 time.sleep(0.02)
             else:
                 self.fail("Managed child survived interrupt escalation")
+            if verification:
+                self.assertTrue(wrapper_pid.is_file())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(wrapper_pid.read_text()), 0)
         finally:
             if process is not None:
                 owned_pids = [process.pid]
-                for pidfile in (timeout_pid, child_pid):
+                for pidfile in (timeout_pid, child_pid, wrapper_pid):
                     if pidfile.is_file() and pidfile.read_text().strip().isdecimal():
                         owned_pids.append(int(pidfile.read_text()))
                 for pid in owned_pids:

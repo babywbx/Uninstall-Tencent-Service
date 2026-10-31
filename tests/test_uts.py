@@ -101,6 +101,8 @@ class UtsFixture(unittest.TestCase):
         )
 
     def official(self, path, prefix="run"):
+        if path.name == "uninst.sh":
+            return f'{prefix} bash {self.root}/tmp/yunjing-uninstall.sh {self.root}/tmp/yunjing-input {path}'
         return f'{prefix} sh -c cd -- "${{1%/*}}" && exec "$1" uts {path}'
 
     def shell_body(self, script):
@@ -161,6 +163,8 @@ class UtsFixture(unittest.TestCase):
         }
 
     def run_shell(self, script, **options):
+        for name in ("yunjing-uninstall.sh", "yunjing-input"):
+            (self.root / "tmp" / name).unlink(missing_ok=True)
         self.events.write_text("")
         body = self.shell_body(script)
         environment = self.shell_environment()
@@ -507,7 +511,7 @@ class MainTests(UtsFixture):
             "           Installed; add --include-monitor to uninstall it too.",
             "  [clean]  TencentCloud Automation Tools (tat_agent)",
             "           Not installed; remnants are still checked and cleaned.",
-            "  Turn off Agent uninstall protection in the Host Security console first.",
+            "  The displayed official uninstall verification code will be entered automatically.",
             "  Without tat_agent, console commands and online password reset stop working.",
             "  To preview without changes, run again with --dry-run.",
         ]

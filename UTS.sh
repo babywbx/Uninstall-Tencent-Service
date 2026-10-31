@@ -111,7 +111,7 @@ ${SCRIPT_NAME} ${VERSION}
 
 主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再停止、
 删除并验证剩余内容，不会执行 init 停止脚本。
-运行前请在主机安全控制台关闭「Agent 卸载保护」，或将本机移出保护范围。
+确认卸载后，会自动填写官方卸载程序显示的验证码。
 VNC 等无法显示中文的终端请加 --lang en。
 
 退出码：
@@ -147,7 +147,7 @@ Options:
 Host Security (YunJing) is always uninstalled. Runs the official uninstallers found
 on the host, then stops, removes and verifies the remnants locally. Init stop
 scripts are never executed.
-Disable Agent uninstall protection in the Host Security console before running.
+After confirmation, automatically enters the code displayed by the official uninstaller.
 
 Exit status:
   0         uninstall verified, or dry run finished
@@ -257,7 +257,7 @@ require_linux() {
 
 prepare_runtime() {
   local tool=""
-  for tool in awk readlink stat grep cksum find timeout flock; do
+  for tool in awk readlink stat grep cksum find timeout flock mkfifo; do
     command_exists "${tool}" || die "Required command missing: ${tool}. Install it before retrying." "缺少必需命令 ${tool}，请安装后重试。"
   done
   if ! timeout -k 1 1 true 2>/dev/null; then
@@ -425,7 +425,7 @@ show_plan() {
   done
   printf '\n'
   if [[ "${DRY_RUN}" -eq 0 ]]; then
-    msg "Turn off Agent uninstall protection in the Host Security console first." "请先在主机安全控制台关闭「Agent 卸载保护」。"
+    msg "The displayed official uninstall verification code will be entered automatically." "将自动填写官方卸载程序显示的验证码。"
     printf '  %s%s%s\n' "${C_YELLOW}" "${MSG}" "${C_RESET}"
     msg "The console then raises an agent uninstall alert." "卸载后控制台会产生 Agent 卸载告警。"
     printf '  %s\n' "${MSG}"
@@ -474,6 +474,38 @@ root_owned_private() {
   (( (8#${mode} & 8#022) == 0 ))
 }
 
+answer_yunjing_code() {
+  local character="" buffer="" last_code=""
+  local prompt='(如果您想继续卸载主机安全客户端，请输入验证码|If you want to uninstall Yunjing, please enter the verification code)[[:blank:]]+([0-9]{6}):$'
+  while IFS= read -r -d '' -n 1 character; do
+    printf '%s' "${character}" || return 1
+    buffer+="${character}"
+    [[ "${#buffer}" -le 512 ]] || buffer="${buffer: -512}"
+    if [[ "${buffer}" =~ ${prompt} && "${BASH_REMATCH[2]}" != "${last_code}" ]]; then
+      last_code="${BASH_REMATCH[2]}"
+      printf '%s\n' "${last_code}" >&4 || return 1
+    fi
+  done
+}
+
+run_yunjing_script() {
+  local helper="${WORKDIR}/yunjing-uninstall.sh" input="${WORKDIR}/yunjing-input"
+  [[ -n "${WORKDIR}" && -d "${WORKDIR}" ]] || return 1
+  mkfifo -m 600 -- "${input}" || return 1
+  {
+    declare -f answer_yunjing_code
+    cat <<'HELPER'
+set -o pipefail
+export LC_ALL=C
+trap ':' TERM
+exec 4<>"$1" || exit 1
+cd -- "${2%/*}" || exit 1
+"$2" <&4 4>&- 2>&1 | answer_yunjing_code
+HELPER
+  } >"${helper}" || return 1
+  run bash "${helper}" "${input}" "$1"
+}
+
 run_local_script() {
   local script_path="$1" root_dir="$3" description="" dir="" header="" rc=0
   OFFICIAL_RAN=0
@@ -505,7 +537,11 @@ run_local_script() {
   fi
   log "Running ${description}" "正在运行${description}"
   OFFICIAL_RAN=1
-  run sh -c 'cd -- "${1%/*}" && exec "$1"' uts "${script_path}" || rc=$?
+  if [[ "${4:-}" == verification ]]; then
+    run_yunjing_script "${script_path}" || rc=$?
+  else
+    run sh -c 'cd -- "${1%/*}" && exec "$1"' uts "${script_path}" || rc=$?
+  fi
   return "${rc}"
 }
 
@@ -1655,10 +1691,10 @@ yunjing_present() {
 }
 
 protection_hint() {
-  warn "Agent uninstall protection is probably on, so the official uninstaller asks for a verification code." \
-    "这通常说明「Agent 卸载保护」已开启，此时官方卸载程序会要求输入验证码。"
-  warn "Turn the protection off in the Host Security console, or run $1/uninst.sh yourself and enter the code." \
-    "请在主机安全控制台关闭该保护，或亲自运行 $1/uninst.sh 并按提示输入验证码。"
+  warn "Official uninstall did not complete automatically; Agent uninstall protection may still be active." \
+    "官方卸载未能自动完成，可能仍受「Agent 卸载保护」限制。"
+  warn "Turn the protection off in the Host Security console, or remove this server from its scope." \
+    "请在主机安全控制台关闭该保护，或将本机移出保护范围。"
 }
 
 yunjing_running() {
@@ -1709,14 +1745,14 @@ uninstall_yunjing() {
   for dir in "${YUNJING_DIRS[@]}"; do
     path_present "${dir}/uninst.sh" || continue
     ran=1
-    run_local_script "${dir}/uninst.sh" "" "${dir}" || official_rc=$?
+    run_local_script "${dir}/uninst.sh" "" "${dir}" verification || official_rc=$?
     break
   done
   [[ "${ran}" -eq 1 ]] || log "No official uninst.sh found; cleaning local remnants only." "未找到官方 uninst.sh，仅清理本地残留。"
   if [[ "${OFFICIAL_RAN}" -eq 1 && "${official_rc}" -eq 0 && "${DRY_RUN}" -eq 0 ]] && path_present "${dir}"; then
     if yunjing_running; then
       warn "The official uninst.sh exited without uninstalling; the agent is still running." "官方 uninst.sh 已退出但没有完成卸载，Agent 仍在运行。"
-      protection_hint "${dir}"
+      protection_hint
       warn "Then run this script again. No local cleanup was done." "完成后重新运行本脚本。本次未做任何本地清理。"
       return 6
     else
@@ -1729,7 +1765,7 @@ uninstall_yunjing() {
     warn "Official uninst.sh exited with status ${official_rc}." "官方 uninst.sh 退出码为 ${official_rc}。"
     if [[ "${FORCE}" -eq 0 || "${official_rc}" -eq 124 || "${official_rc}" -ge 128 ]]; then
       warn "Local cleanup was not started. Resolve the official failure before retrying." "未开始本地清理，请先解决官方卸载失败的问题再重试。"
-      [[ "${official_rc}" -lt 128 ]] || protection_hint "${dir}"
+      [[ "${official_rc}" -lt 128 ]] || protection_hint
       return "${official_rc}"
     fi
     warn "Force mode: trying scoped local cleanup." "强制模式：尝试限定范围的本地清理。"

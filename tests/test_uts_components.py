@@ -153,10 +153,51 @@ class YunjingTests(UtsFixture):
             [self.official(script, "timeout -k 5 120"), *self.local_cleanup()],
         )
 
+    def test_official_verification_code_is_filled_before_cleanup(self):
+        chinese = "如果您想继续卸载主机安全客户端，请输入验证码 012345: "
+        english = "If you want to uninstall Yunjing, please enter the verification code 012345: "
+        for prompt, stream in (
+            (chinese + "\n", 1),
+            (english + "\n", 1),
+            (chinese + "\n" + english + "\n", 1),
+            (chinese, 1),
+            (english, 2),
+        ):
+            with self.subTest(prompt=prompt, stream=stream):
+                self.reset()
+                self.vendor_script(
+                    self.primary / "uninst.sh",
+                    "#!/bin/bash\n"
+                    + f"printf '%s' {shlex.quote(prompt)} >&{stream}\n"
+                    + 'IFS= read -r code || exit 7\n[[ "$code" == 012345 ]] || exit 8\n'
+                    + f"printf 'verified\\n' > {shlex.quote(str(self.vendor_log))}\n",
+                )
+                result = self.run_shell(self.executed())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.vendor_log.read_text(), "verified\n")
+                self.assertIn(prompt, result.stdout)
+                self.assertIn("stop-services YDService YDLive", self.events.read_text())
+
+    def test_bilingual_code_is_sent_once_and_refreshed_code_is_answered(self):
+        self.vendor_script(
+            self.primary / "uninst.sh",
+            "#!/bin/bash\n"
+            + "for expected in 012345 678901; do\n"
+            + "  printf '如果您想继续卸载主机安全客户端，请输入验证码 %s: \\n' \"$expected\"\n"
+            + "  printf 'If you want to uninstall Yunjing, please enter the verification code %s: \\n' \"$expected\"\n"
+            + '  IFS= read -r code || exit 7\n  [[ "$code" == "$expected" ]] || exit 8\n'
+            + f"  printf '%s\\n' \"$code\" >> {shlex.quote(str(self.vendor_log))}\ndone\n",
+        )
+        result = self.run_shell(self.executed())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.vendor_log.read_text(), "012345\n678901\n")
+
     def test_verified_official_uninstall_continues_selected_components(self):
         self.vendor_script(
             self.primary / "uninst.sh",
-            "#!/bin/bash\nprintf 'remove YunJing software success\\n'\n",
+            "#!/bin/bash\n"
+            + "printf '如果您想继续卸载主机安全客户端，请输入验证码 012345: \\n'\n"
+            + 'IFS= read -r code && [[ "$code" == 012345 ]] || exit 7\n',
         )
         result = self.run_shell(
             self.local_stubs + ROOT_STAT + EXECUTE + self.real_function("run")
@@ -170,6 +211,20 @@ class YunjingTests(UtsFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.events.read_text().splitlines()[-3:], ["monitor", "tat", "verify"])
         self.assertIn("local uninstall verified", result.stdout)
+
+    def test_only_complete_official_prompts_receive_a_code(self):
+        self.vendor_script(
+            self.primary / "uninst.sh",
+            "#!/bin/bash\n"
+            + "printf 'status 123456: \\nplease enter the verification code 123456: \\n'\n"
+            + "printf 'If you want to uninstall Yunjing, please enter the verification code 1234567: \\n'\n"
+            + "printf 'If you want to uninstall Yunjing, please enter the verification code 12345: \\n'\n"
+            + "printf 'If you want to uninstall Yunjing, please enter the verification code '\n"
+            + "printf '012345: '\n"
+            + 'IFS= read -r code || exit 7\n[[ "$code" == 012345 ]] || exit 8\n',
+        )
+        result = self.run_shell(self.executed())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_official_uninstaller_failure_stops_unless_forced(self):
         cases = (
@@ -212,7 +267,7 @@ class YunjingTests(UtsFixture):
                     else:
                         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                         self.assertIn("Local cleanup was not started.", result.stderr)
-                        self.assertEqual("Agent uninstall protection is probably on" in result.stderr, expected >= 128)
+                        self.assertEqual("Agent uninstall protection may still be active" in result.stderr, expected >= 128)
                         self.assertEqual(self.events.read_text().splitlines(), official)
                         self.assertTrue(script.is_symlink() or script.is_file())
 
@@ -237,7 +292,7 @@ class YunjingTests(UtsFixture):
                     self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
                     self.assertEqual(self.events.read_text().splitlines(), [official] + ["sleep 1"] * 4)
                     self.assertIn("official uninst.sh exited without uninstalling", result.stderr)
-                    self.assertIn("run " + str(script) + " yourself and enter the code", result.stderr)
+                    self.assertIn("or remove this server from its scope.", result.stderr)
                     self.assertIn("No local cleanup was done.", result.stderr)
                     self.assertTrue(cron.exists())
                 else:
@@ -294,7 +349,7 @@ class YunjingTests(UtsFixture):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertFalse(self.vendor_log.exists())
                 self.assertEqual(self.events.read_text().splitlines(), self.local_cleanup())
-                self.assertNotIn("run " + str(self.primary / "uninst.sh") + " yourself", result.stderr)
+                self.assertNotIn("or remove this server from its scope.", result.stderr)
 
     def test_installer_download_dirs_are_removed_only_when_they_match(self):
         tmp = self.root / "tmp"
@@ -492,7 +547,7 @@ class YunjingTests(UtsFixture):
         self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
         self.assertEqual(self.events.read_text().splitlines(), ["sleep 5"] * 12)
 
-    def test_dry_run_does_not_run_the_official_uninstaller(self):
+    def test_dry_run_does_not_start_verification_or_create_pipes(self):
         self.vendor_script(self.primary / "uninst.sh", self.logging_script("unexpected"))
         snapshot = self.file_snapshot()
         result = self.run_shell(self.executed("exec 3>&1\nDRY_RUN=1\n"))
