@@ -112,6 +112,7 @@ ${SCRIPT_NAME} ${VERSION}
 主机安全（YunJing）始终会被卸载。脚本先运行主机上的官方卸载程序，再停止、
 删除并验证剩余内容，不会执行 init 停止脚本。
 确认卸载后，会自动填写官方卸载程序显示的验证码。卸载后复查 5 秒。
+失败时保留服务备份，成功验证后删除本次运行创建的备份。
 VNC 等无法显示中文的终端请加 --lang en。
 
 退出码：
@@ -149,6 +150,7 @@ on the host, then stops, removes and verifies the remnants locally. Init stop
 scripts are never executed.
 After confirmation, automatically enters the code displayed by the official uninstaller.
 Checks for agent reappearance for 5 seconds after removal.
+Service backups are kept on failure; this run's backups are removed after successful verification.
 
 Exit status:
   0         uninstall verified, or dry run finished
@@ -2006,6 +2008,17 @@ main() {
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     step "Verification" "验证"
     if verify_uninstall; then
+      if [[ "${FAILURES}" -eq 0 && -n "${MASK_BACKUP}" ]]; then
+        if remove_path "${MASK_BACKUP}" tree; then
+          MASK_BACKUP=""
+        else
+          rc=$?
+          record_failure "Cannot remove this run's service backup: ${MASK_BACKUP}." "无法删除本次运行的服务备份：${MASK_BACKUP}。"
+          finish 1
+          if stop_on "${rc}"; then return "${rc}"; fi
+          return 1
+        fi
+      fi
       ok "No agent files, processes, services or cron entries remain." "未发现 Agent 文件、进程、服务或定时任务残留。"
     else
       verify_rc=$?
