@@ -74,6 +74,7 @@ interrupt() {
     [[ "${TIMEOUT_KILL[0]}" != -s ]] || stop_signal=ALRM
     kill "-${stop_signal}" "${RUN_PID}" 2>/dev/null || true
     wait "${RUN_PID}" 2>/dev/null || true
+    kill -KILL -- "-${RUN_PID}" 2>/dev/null || true
   fi
   if [[ "${STEP}" -eq 0 ]]; then
     warn "Interrupted; nothing was changed." "已中断，未做任何修改。" || true
@@ -221,6 +222,7 @@ query() {
   timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null 9>&- >"${output}" 2>"${errors}" &
   RUN_PID=$!
   wait "${RUN_PID}" || rc=$?
+  [[ "${rc}" -ne 124 && "${rc}" -ne 137 ]] || kill -KILL -- "-${RUN_PID}" 2>/dev/null || true
   RUN_PID=""
   QUERY_OUTPUT="$(cat -- "${output}")" || { command rm -f -- "${output}" "${errors}"; return 1; }
   QUERY_ERROR="$(cat -- "${errors}")" || { command rm -f -- "${output}" "${errors}"; return 1; }
@@ -234,6 +236,7 @@ run() {
     timeout "${TIMEOUT_KILL[@]}" "${COMMAND_TIMEOUT}" "$@" </dev/null 9>&- &
     RUN_PID=$!
     wait "${RUN_PID}" || rc=$?
+    [[ "${rc}" -ne 124 && "${rc}" -ne 137 ]] || kill -KILL -- "-${RUN_PID}" 2>/dev/null || true
     RUN_PID=""
     if [[ "${rc}" -ne 0 ]]; then
       command="$(printf ' %q' "$@")"

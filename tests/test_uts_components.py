@@ -251,6 +251,7 @@ class YunjingTests(UtsFixture):
                         self.vendor_script(script, payload)
                     result = self.run_shell(self.executed(f"FORCE={force}\n"))
                     official = [self.official(script, "timeout -k 5 120")] if executed else []
+                    official += ["kill-group"] if status in (124, 137) else []
                     expected = status
                     if expected is None:
                         reported = re.search(r"Official uninst\.sh exited with status (\d+)\.", result.stderr)
@@ -753,6 +754,7 @@ class MonitorTests(UtsFixture):
                         + f"FORCE={force}\nuninstall_monitor\n"
                     )
                     barad_run = [] if name == "unknown format" else [self.official(barad, "timeout -k 5 120")]
+                    barad_run += ["kill-group"] if status == 124 else []
                     events = self.events.read_text().splitlines()
                     if force and status < 124:
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

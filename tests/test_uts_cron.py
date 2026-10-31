@@ -164,7 +164,7 @@ class RootCrontabTests(UtsFixture):
                 )
                 self.assert_failed(result)
                 self.assertIn("Cannot read the root crontab.", result.stderr)
-                self.assertEqual(self.events.read_text(), "")
+                self.assertEqual(self.events.read_text(), "kill-group\n" if status in (124, 137) else "")
                 self.assertFalse(self.written.exists())
 
     def test_removal_is_scoped_to_component_patterns(self):

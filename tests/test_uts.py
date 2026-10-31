@@ -115,7 +115,13 @@ class UtsFixture(unittest.TestCase):
             sudo() { blocked sudo "$@"; }
             rm() { record "rm $*"; return 0; }
             rmdir() { record "rmdir $*"; return 0; }
-            kill() { blocked kill "$@"; }
+            kill() {
+              if [[ $# -eq 3 && "$1 $2" == "-KILL --" && -n "${RUN_PID:-}" && "$3" == "-${RUN_PID}" ]]; then
+                record kill-group
+              else
+                blocked kill "$@"
+              fi
+            }
             pkill() { blocked pkill "$@"; }
             killall() { blocked killall "$@"; }
             chattr() { blocked chattr "$@"; }

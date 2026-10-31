@@ -206,6 +206,7 @@ class RuntimeTests(UtsFixture):
         binaries.mkdir()
         timeout_pid = self.base / "timeout.pid"
         child_pid = self.base / "child.pid"
+        grandchild_pid = self.base / "grandchild.pid"
         timeout_shim = binaries / "timeout"
         timeout_shim.write_text(
             "#!/bin/sh\n"
@@ -213,12 +214,16 @@ class RuntimeTests(UtsFixture):
             + f'exec {shlex.quote(GNU_TIMEOUT)} "$@"\n'
         )
         timeout_shim.chmod(0o755)
+        child_command = (
+            'printf "%s\\n" "$$" > "$1"; '
+            + '(trap "" TERM; exec sleep 30) >/dev/null 2>&1 & '
+            + 'printf "%s\\n" "$!" > "$2"; wait'
+        )
         body = (
             f"source {shlex.quote(str(self.source))}\n"
             + "COMMAND_TIMEOUT=1\nrc=0\n"
-            + f"run {shlex.quote(BASH)} -c "
-            + shlex.quote('printf "%s\\n" "$$" > "$1"; exec sleep 30')
-            + f" uts-runtime {shlex.quote(str(child_pid))} || rc=$?\n"
+            + f"run {shlex.quote(BASH)} -c {shlex.quote(child_command)}"
+            + f" uts-runtime {shlex.quote(str(child_pid))} {shlex.quote(str(grandchild_pid))} || rc=$?\n"
             + 'printf "status=%s\\nrun_pid=%s\\n" "$rc" "$RUN_PID"\n'
             + '[[ "$rc" -eq 124 && -z "$RUN_PID" ]]\n'
         )
@@ -246,9 +251,19 @@ class RuntimeTests(UtsFixture):
             self.assertTrue(child_pid.is_file())
             with self.assertRaises(ProcessLookupError):
                 os.kill(int(child_pid.read_text()), 0)
+            grandchild = int(grandchild_pid.read_text())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(grandchild, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("TERM-ignoring grandchild survived the deadline")
         finally:
             owned_pids = [process.pid]
-            for pidfile in (timeout_pid, child_pid):
+            for pidfile in (timeout_pid, child_pid, grandchild_pid):
                 if pidfile.is_file():
                     value = pidfile.read_text().strip()
                     if value.isdecimal():
