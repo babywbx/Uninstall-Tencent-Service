@@ -5,7 +5,7 @@
 一键卸载腾讯云主机安全（云镜 YunJing）Agent 并清理残留的 Bash 脚本，<br/>
 可选同时卸载云监控（BaradAgent / Sgagent）和自动化助手（TAT）。
 
-[报告问题][github-issues-link] · [参考文档][doc-yunjing-link]
+[English](./README.en.md) · [报告问题][github-issues-link] · [参考文档][doc-yunjing-link]
 
 <!-- SHIELD GROUP -->
 
