@@ -19,6 +19,10 @@
 
 </div>
 
+> \[!TIP]
+>
+> **在找阿里云的方案吗？** 请使用同系列的 [Uninstall Aliyun Service][uas-link]，一键卸载阿里云云安全中心（云盾）Agent，可选同时卸载云助手、云监控和 LoongCollector。
+
 <details>
 <summary><kbd>目录</kbd></summary>
 
@@ -29,7 +33,9 @@
 - [🚀 快速开始](#-快速开始)
 - [📖 用法](#-用法)
 - [🔩 执行流程](#-执行流程)
+- [🧪 实测记录](#-实测记录)
 - [🛠 故障排查](#-故障排查)
+- [🔗 相关项目](#-相关项目)
 - [📚 参考资料](#-参考资料)
 - [📝 许可证](#-许可证)
 
@@ -49,6 +55,7 @@
 - 🧹 清理官方卸载程序遗留的定时任务、服务单元、运行时目录、安装包、PID 文件和 cgroup
 - 🔍 卸载后验证文件、进程、服务和定时任务，并复查 Agent 是否重新出现
 - 🌐 不下载额外的卸载脚本，默认中文输出，`--lang en` 切换英文
+- ✅ 已在 140 多台腾讯云服务器、38 个公共镜像上实测，见[实测记录](#-实测记录)
 
 脚本只处理上述三个组件的已知路径。`/usr/local/qcloud` 下镜像初始化用的其他文件保持不变，脚本也不会修改控制台设置或重启系统。
 
@@ -84,6 +91,8 @@
 | CPU 架构 | x86_64、aarch64 |
 | Bash 版本 | 4.1 及以上 |
 | coreutils | GNU coreutils，以及 Ubuntu 26.04 默认的 uutils coreutils |
+
+各系统的实测情况见[实测记录](#-实测记录)。
 
 <div align="right">
 
@@ -266,6 +275,63 @@ sudo bash UTS.sh --force
 
 </div>
 
+## 🧪 实测记录
+
+项目已在 140 多台腾讯云服务器上进行多轮实测，覆盖 11 个发行版系列的 38 个公共镜像，其中 5 个是 ARM64。测试包含三个组件全部安装、仅安装部分组件和没有 Agent 的情况，并结合不同权限、保护状态和运行方式验证清理结果。
+
+### 测试内容
+
+| 项目 | 做法 |
+| --- | --- |
+| 卸载组合 | 默认参数，逐个加上 `--include-monitor` 和 `--include-tat`，一次全选，以及 `--force` |
+| 重跑与中断 | 每次卸载后立即重跑一遍；执行中途发送中断信号，再重新运行完成清理 |
+| 残留检查 | 卸载前后核对进程、服务、定时任务和 cgroup，并在整个文件系统中搜索 Agent 相关的文件和配置引用 |
+| 防误操作 | 查看版本、没有终端、在终端或管道中取消确认、预览、英文预览，取消后确认系统没有任何改动 |
+| 卸载保护 | 分别在开启和关闭「Agent 卸载保护」时执行 |
+| 长时间观察 | 卸载后观察 10 分钟，再重启并观察 5 分钟，检查观察期内是否重装 |
+| 自动化助手 | 从控制台下发预览和默认卸载，确认加 `--include-tat` 时会拒绝，再用 `systemd-run` 完整卸载 |
+| 自动化测试 | 在 Linux 上分别以 root 和普通用户运行，覆盖路径安全、进程身份、超时中断、定时任务解析和终端交互；并在 40 台实机上各跑一遍完整测试套件，80 次全部通过 |
+| 备份清理 | 验证成功后删除本次生成的备份；失败时保留恢复材料，不误删已有备份 |
+| 进程扫描 | 使用千级进程的隔离目录验证观察窗口耗时和进程身份复核 |
+
+### 覆盖范围
+
+已验证的发行版与版本如下，各项场景按适用环境组合测试：
+
+| 发行版 | 版本 |
+| --- | --- |
+| TencentOS Server | 2.4、3.1、3.3、4，以及 4（ARM64） |
+| OpenCloudOS | 7、8、9，以及 9（ARM64） |
+| CentOS | 6.10、7.9、8.5，以及 7.9（ARM64） |
+| CentOS Stream | 9、10 |
+| Rocky Linux | 8.10、9.8、10.2 |
+| AlmaLinux | 8.10、9.8、10.2 |
+| Fedora | 40 |
+| openSUSE Leap | 15.6 |
+| Debian | 9、10、11、12、13，以及 11（ARM64） |
+| Ubuntu | 14.04、16.04、18.04、20.04、22.04、24.04、26.04，以及 22.04（ARM64） |
+| CoreOS | 1745.5.0 |
+
+实机测试覆盖防卸载开关、强制卸载、预览与取消、TAT 控制台拒绝、残留清理和重复执行。持续观察及重启复查均未发现重装，结论对应上述观察窗口。
+
+观察窗口按实际耗时计算，避免在进程较多时固定重复全量扫描，同时保留进程身份复核和最终检查。
+
+### 实测发现
+
+- **Agent 卸载保护**：开启后，官方程序可能要求输入验证码。实测自动填写后可以正常卸载；交互没有完成或保护仍阻止清理时才会停止并提示处理。
+- **验证码**：官方 `uninst.sh` 是编译好的程序，会显示 6 位验证码要求确认。脚本在你确认后自动填写，`--dry-run` 不会运行它。
+- **输出缓冲**：某些官方程序接到管道后会缓存验证码提示，导致等待输入却不显示提示。脚本使用 `stdbuf` 关闭该程序的输出缓冲，支持无换行提示，并避免同一个中英文验证码重复提交。
+- **官方程序的遗留**：主机安全卸载后会留下 `/var/cache/ydeyes`、安装日志、PID 文件、cgroup 和 `/tmp` 中的安装包；云监控官方卸载不删 `monitor/python26` 和 `monitor/config`；自动化助手的官方脚本不删 `/usr/local/bin/tat_agent`。脚本会一并清理。
+- **Sgagent 文件属主**：云监控安装包中的 `stargate` 目录属主为 uid 501 且组可写，脚本会提示「安装目录不属于 root」，并跳过 Sgagent 自带的卸载程序，改为本地清理。这是预期行为。
+- **老系统**：Ubuntu 14.04（Upstart）和 CentOS 6.10（Bash 4.1，`timeout` 不支持 `-k`）都可以正常卸载。
+- **自动化助手控制台**：从控制台执行默认卸载或预览没有问题。加 `--include-tat` 时脚本会拒绝，因为停止 `tat_agent` 会连同脚本一起终止，改用 SSH 或 `systemd-run` 即可，见[故障排查](#-故障排查)。
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
 ## 🛠 故障排查
 
 ### 返回 6：Agent 未被卸载
@@ -326,6 +392,16 @@ uv run --no-project python -m unittest discover -s tests -v
 
 </div>
 
+## 🔗 相关项目
+
+- [Uninstall Aliyun Service][uas-link]：本项目的阿里云版本。一键卸载阿里云云安全中心（云盾）Agent，可选同时卸载云助手、云监控和 LoongCollector，同样先调用官方卸载程序再清理残留，并在阿里云多个发行版上实测过。
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
 ## 📚 参考资料
 
 - [腾讯云：主机安全快速入门（含卸载客户端）][doc-yunjing-link]
@@ -367,3 +443,4 @@ Copyright © 2018-present [Babywbx][profile-link].<br/>
 [github-stars-link]: https://github.com/babywbx/Uninstall-Tencent-Service/stargazers
 [github-stars-shield]: https://img.shields.io/github/stars/babywbx/Uninstall-Tencent-Service?color=ffcb47&labelColor=black&style=flat-square
 [profile-link]: https://github.com/babywbx
+[uas-link]: https://github.com/babywbx/Uninstall-Aliyun-Service

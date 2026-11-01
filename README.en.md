@@ -19,6 +19,10 @@ optionally removing Cloud Monitor (BaradAgent / Sgagent) and TencentCloud Automa
 
 </div>
 
+> \[!TIP]
+>
+> **Looking for an Alibaba Cloud solution?** Use the companion project [Uninstall Aliyun Service][uas-link], which uninstalls the Alibaba Cloud Security Center (YunDun) agent and optionally Cloud Assistant, CloudMonitor and LoongCollector.
+
 <details>
 <summary><kbd>Table of Contents</kbd></summary>
 
@@ -29,7 +33,9 @@ optionally removing Cloud Monitor (BaradAgent / Sgagent) and TencentCloud Automa
 - [🚀 Quick Start](#-quick-start)
 - [📖 Usage](#-usage)
 - [🔩 How It Works](#-how-it-works)
+- [🧪 Live Test Results](#-live-test-results)
 - [🛠 Troubleshooting](#-troubleshooting)
+- [🔗 Related Projects](#-related-projects)
 - [📚 References](#-references)
 - [📝 License](#-license)
 
@@ -49,6 +55,7 @@ Tencent Cloud servers can have Host Security, Cloud Monitor and Automation Tools
 - 🧹 Cleans up cron jobs, service units, runtime directories, installer packages, PID files and cgroups left by the official uninstallers
 - 🔍 Verifies known files, processes, services and cron jobs after removal, with a short observation window for agent reappearance
 - 🌐 Fetches no additional uninstallers; prints Chinese by default, `--lang en` switches to English. Official vendor programs may contact Tencent Cloud
+- ✅ Tested on more than 140 Tencent Cloud servers across 38 public images, see [Live Test Results](#-live-test-results)
 
 The script only touches the known paths of these three components. Other image initialization files under `/usr/local/qcloud` stay untouched, and the script never changes console settings or reboots the system.
 
@@ -84,6 +91,8 @@ The script checks dependencies but never installs software. When `timeout` lacks
 | CPU architectures | x86_64, aarch64 |
 | Bash | 4.1 or later |
 | coreutils | GNU coreutils, and the uutils coreutils shipped by default on Ubuntu 26.04 |
+
+See [Live Test Results](#-live-test-results) for what was verified on real servers.
 
 <div align="right">
 
@@ -264,6 +273,62 @@ Key safety rules:
 
 </div>
 
+## 🧪 Live Test Results
+
+The project has been tested over multiple rounds on more than 140 Tencent Cloud servers, covering 38 public images across 11 distribution families, including 5 ARM64 images. Testing includes complete, partial and missing installations, with different privilege levels, protection settings and ways of launching the script.
+
+### What Was Tested
+
+| Area | Method |
+| --- | --- |
+| Option combinations | Default options, adding `--include-monitor` and `--include-tat` one at a time, all at once, and `--force` |
+| Reruns and interruptions | An immediate rerun after every uninstall; an interrupt signal in the middle of a run, then a fresh run to finish |
+| Remnant checks | Processes, services, cron jobs and cgroups compared before and after, plus a whole-filesystem search for agent files and config references |
+| Misoperation safety | Version output, no terminal, canceling at a terminal prompt or through a pipe, preview, English preview, and confirming the system was untouched after canceling |
+| Uninstall protection | Runs with Agent uninstall protection both on and off |
+| Long observation | 10 minutes after uninstalling, then a reboot and another 5 minutes of observation; no agent reinstallation was observed in those intervals |
+| Automation Tools | Preview and default uninstall sent from the console, the `--include-tat` refusal, and a full removal through `systemd-run` |
+| Automated tests | Linux runs as root and as a regular user, covering path safety, process identity, timeouts, interruptions, cron parsing and terminal interaction; the full suite also ran on 40 real servers in both modes, all 80 runs passing |
+| Backup cleanup | After a successful full run, this run's service backup was removed and an existing backup was preserved |
+| Process scanning | Isolated directories with a thousand process entries to check observation timing and process identity validation |
+
+### Coverage
+
+The following distributions and versions have been verified, with scenarios combined as appropriate for each environment:
+
+| Distribution | Versions |
+| --- | --- |
+| TencentOS Server | 2.4, 3.1, 3.3, 4, plus 4 (ARM64) |
+| OpenCloudOS | 7, 8, 9, plus 9 (ARM64) |
+| CentOS | 6.10, 7.9, 8.5, plus 7.9 (ARM64) |
+| CentOS Stream | 9, 10 |
+| Rocky Linux | 8.10, 9.8, 10.2 |
+| AlmaLinux | 8.10, 9.8, 10.2 |
+| Fedora | 40 |
+| openSUSE Leap | 15.6 |
+| Debian | 9, 10, 11, 12, 13, plus 11 (ARM64) |
+| Ubuntu | 14.04, 16.04, 18.04, 20.04, 22.04, 24.04, 26.04, plus 22.04 (ARM64) |
+| CoreOS | 1745.5.0 |
+
+Real-server tests cover protection-enabled and protection-disabled removal, force mode, confirmation and preview behavior, TAT self-removal refusal, remnant cleanup and reruns. No reinstallation was observed during the stated observation and reboot checks.
+
+The observation window uses elapsed time to avoid a fixed number of repeated full scans on busy servers, while retaining process identity validation and final checks.
+
+### Findings
+
+- **Agent uninstall protection**: official removal succeeded with protection enabled after automatic code entry. Protection does not need to be disabled first. If the official program leaves the agent running, the script returns `6` before local cleanup.
+- **Verification code**: the official `uninst.sh` is a compiled program that can display a 6-digit verification code. Real-server testing exposed output buffering through pipes; `stdbuf` lets the script receive and answer that prompt. `--dry-run` never runs the official program.
+- **What the official uninstallers leave**: Host Security leaves `/var/cache/ydeyes`, install logs, PID files, cgroups and installer packages in `/tmp`; the Cloud Monitor uninstallers keep `monitor/python26` and `monitor/config`; the Automation Tools uninstaller keeps `/usr/local/bin/tat_agent`. The script removes all of them.
+- **Sgagent file ownership**: the `stargate` directory from the Cloud Monitor package is owned by uid 501 and group-writable. The script warns that the install directory is not owned by root, skips Sgagent's own uninstaller and cleans up locally. This is expected.
+- **Older systems**: Ubuntu 14.04 (Upstart) and CentOS 6.10 (Bash 4.1, `timeout` without `-k`) both uninstall normally.
+- **Automation Tools console**: running the default uninstall or a preview from the console works. With `--include-tat` the script refuses, because stopping `tat_agent` would also kill the script; use SSH or `systemd-run` instead, see [Troubleshooting](#-troubleshooting).
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
 ## 🛠 Troubleshooting
 
 ### Status 6: the agent was not removed
@@ -328,6 +393,16 @@ The tests isolate service changes and file removal in temporary fixtures. They a
 
 </div>
 
+## 🔗 Related Projects
+
+- [Uninstall Aliyun Service][uas-link]: the Alibaba Cloud counterpart of this project. It uninstalls the Alibaba Cloud Security Center (YunDun) agent, optionally Cloud Assistant, CloudMonitor and LoongCollector, also running the official uninstallers first and then cleaning up leftovers, and has been tested on many Alibaba Cloud distributions.
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
 ## 📚 References
 
 - [Tencent Cloud: Host Security quick start, including client uninstall (Chinese)][doc-yunjing-link]
@@ -369,3 +444,4 @@ This project is licensed under the [MIT](./LICENSE) License.
 [github-stars-link]: https://github.com/babywbx/Uninstall-Tencent-Service/stargazers
 [github-stars-shield]: https://img.shields.io/github/stars/babywbx/Uninstall-Tencent-Service?color=ffcb47&labelColor=black&style=flat-square
 [profile-link]: https://github.com/babywbx
+[uas-link]: https://github.com/babywbx/Uninstall-Aliyun-Service
